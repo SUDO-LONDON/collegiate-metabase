@@ -98,6 +98,26 @@
        (#'starrez.db/prepare-report-csv
         [["Entry ID"] ["123"]]))))
 
+(deftest report-load-strategy-falls-back-to-replace-when-booking-id-is-not-mergeable
+  (is (= {:mode :merge}
+         (#'starrez.db/report-load-strategy
+          (#'starrez.db/parse-report-csv
+           [["Booking ID" "Room"]
+            ["123" "A"]]))))
+  (is (= {:mode :replace
+          :issue "CSV contains duplicate booking_id values"}
+         (#'starrez.db/report-load-strategy
+          (#'starrez.db/parse-report-csv
+           [["Booking ID" "Room"]
+            ["123" "A"]
+            ["123" "B"]]))))
+  (is (= {:mode :replace
+          :issue "CSV is missing required booking_id column"}
+         (#'starrez.db/report-load-strategy
+          (#'starrez.db/parse-report-csv
+           [["Entry ID" "Room"]
+            ["111" "A"]])))))
+
 (deftest merge-report-exports-routes-each-report-to-its-own-table
   (let [merged (atom [])]
     (with-redefs [starrez.db/merge-report-csv!

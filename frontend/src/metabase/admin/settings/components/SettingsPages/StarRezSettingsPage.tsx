@@ -252,7 +252,9 @@ function ExportSection() {
                 ? t`Failed`
                 : report.created_table
                   ? t`Created`
-                  : t`Merged`;
+                  : report.replaced_table
+                    ? t`Replaced`
+                    : t`Merged`;
 
               return (
                 <Paper key={report.report_id} withBorder p="md">
@@ -272,12 +274,20 @@ function ExportSection() {
                         {report.error}
                       </Text>
                     ) : (
-                      <Text size="sm" c="text-secondary">
-                        {t`Updated: ${report.updated?.toLocaleString() ?? "0"}`}{" "}
-                        •{" "}
-                        {t`Inserted: ${report.inserted?.toLocaleString() ?? "0"}`}{" "}
-                        • {t`New columns: ${report.added_columns?.length ?? 0}`}
-                      </Text>
+                      <Stack gap={2}>
+                        <Text size="sm" c="text-secondary">
+                          {t`Updated: ${report.updated?.toLocaleString() ?? "0"}`}{" "}
+                          •{" "}
+                          {t`Inserted: ${report.inserted?.toLocaleString() ?? "0"}`}{" "}
+                          •{" "}
+                          {t`New columns: ${report.added_columns?.length ?? 0}`}
+                        </Text>
+                        {report.merge_key_issue && (
+                          <Text size="sm" c="text-secondary">
+                            {t`Loaded by replacement: ${report.merge_key_issue}`}
+                          </Text>
+                        )}
+                      </Stack>
                     )}
                   </Stack>
                 </Paper>

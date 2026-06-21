@@ -317,8 +317,9 @@
           table-name]
          {:builder-fn rs/as-unqualified-lower-maps})))
 
-(defn- prepare-report-csv
-  "Validate and normalize a report CSV for merging."
+(defn- parse-report-csv
+  "Parse and normalize a report CSV. Returns booking_id analysis so callers can
+  decide whether the report can be merged or must be loaded by replacement."
   [csv-rows]
   (let [headers      (first csv-rows)
         _            (when-not (seq headers)
@@ -331,21 +332,45 @@
                                        {:columns     (count columns)
                                         :max-columns postgres-max-columns})))
         booking-idx  (.indexOf ^java.util.List columns report-merge-key)
-        _            (when (neg? booking-idx)
-                       (throw (ex-info "CSV is missing required booking_id column" {})))
         rows         (mapv (fn [row]
                              (let [row (vec (take (count columns) (concat row (repeat ""))))]
-                               (assoc row booking-idx (str/trim (str (get row booking-idx))))))
+                               (if (neg? booking-idx)
+                                 row
+                                 (assoc row booking-idx (str/trim (str (get row booking-idx)))))))
                            (rest csv-rows))
-        booking-ids  (mapv #(get % booking-idx) rows)
+        booking-ids  (when-not (neg? booking-idx)
+                       (mapv #(get % booking-idx) rows))
         blank-count  (count (filter str/blank? booking-ids))
         duplicates   (->> booking-ids frequencies (keep (fn [[booking-id n]] (when (> n 1) booking-id))) vec)]
+    {:columns columns
+     :rows    rows
+     :booking-idx booking-idx
+     :blank-count blank-count
+     :duplicates duplicates}))
+
+(defn- prepare-report-csv
+  "Validate and normalize a report CSV for merging."
+  [csv-rows]
+  (let [{:keys [columns rows booking-idx blank-count duplicates]} (parse-report-csv csv-rows)]
+    (when (neg? booking-idx)
+      (throw (ex-info "CSV is missing required booking_id column" {})))
     (when (pos? blank-count)
       (throw (ex-info "CSV contains blank booking_id values" {:blank_booking_ids blank-count})))
     (when (seq duplicates)
       (throw (ex-info "CSV contains duplicate booking_id values" {:duplicate_booking_ids duplicates})))
     {:columns columns
      :rows    rows}))
+
+(defn- report-load-strategy
+  [{:keys [booking-idx blank-count duplicates]}]
+  (cond
+    (neg? booking-idx) {:mode :replace
+                        :issue "CSV is missing required booking_id column"}
+    (pos? blank-count) {:mode :replace
+                        :issue "CSV contains blank booking_id values"}
+    (seq duplicates)   {:mode :replace
+                        :issue "CSV contains duplicate booking_id values"}
+    :else              {:mode :merge}))
 
 (defn- create-table! [conn table-name columns]
   (let [tbl     (qualified-table-name data-schema table-name)
@@ -438,6 +463,23 @@
      :inserted      (count rows)
      :updated       0}))
 
+(defn- drop-table! [conn table-name]
+  (let [destination (qualified-table-name data-schema table-name)]
+    (jdbc/execute! conn [(str "DROP TABLE IF EXISTS " destination)])))
+
+(defn- replace-report-table! [conn destination-table columns rows table-existed?]
+  (when table-existed?
+    (drop-table! conn destination-table))
+  (let [destination (qualified-table-name data-schema destination-table)]
+    (create-table! conn destination-table columns)
+    (when (seq rows)
+      (copy-rows! conn destination columns rows))
+    {:added_columns columns
+     :created_table (not table-existed?)
+     :replaced_table table-existed?
+     :inserted      (count rows)
+     :updated       0}))
+
 (defn- merge-existing-report-table! [conn destination-table columns rows]
   (let [added-columns (add-missing-columns! conn destination-table columns)
         _             (normalize-destination-booking-ids! conn destination-table)
@@ -454,18 +496,25 @@
 (defn- merge-report-csv!
   [destination-table report-id csv-body]
   (try
-    (let [{:keys [columns rows]} (prepare-report-csv (read-csv csv-body))]
+    (let [parsed-report-csv (parse-report-csv (read-csv csv-body))
+          {:keys [columns rows]} parsed-report-csv
+          {:keys [mode issue]} (report-load-strategy parsed-report-csv)]
       (with-open [conn (get-connection)]
         (.setAutoCommit conn false)
         (try
           (set-activation-timeouts! conn)
           (let [table-exists? (table-exists? conn destination-table)
-                result        (if table-exists?
-                                (merge-existing-report-table! conn destination-table columns rows)
-                                (create-and-load-report-table! conn destination-table columns rows))]
+                result        (case mode
+                                :merge
+                                (if table-exists?
+                                  (merge-existing-report-table! conn destination-table columns rows)
+                                  (create-and-load-report-table! conn destination-table columns rows))
+                                :replace
+                                (replace-report-table! conn destination-table columns rows table-exists?))]
             (.commit conn)
-            (merge {:report_id         report-id
-                    :destination_table (str data-schema "." destination-table)}
+            (merge (cond-> {:report_id         report-id
+                            :destination_table (str data-schema "." destination-table)}
+                     issue (assoc :merge_key_issue issue))
                    result))
           (catch Exception e
             (.rollback conn)

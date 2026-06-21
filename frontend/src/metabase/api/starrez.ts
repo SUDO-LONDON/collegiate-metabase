@@ -69,6 +69,8 @@ export interface StarRezReportMergeResult {
   updated?: number;
   added_columns?: string[];
   created_table?: boolean;
+  replaced_table?: boolean;
+  merge_key_issue?: string;
   error?: string;
 }
 
