@@ -178,7 +178,7 @@ function ExportSection() {
     <SettingsSection title={t`Export StarRez Data`}>
       <Stack gap="md">
         <Text c="text-secondary">
-          {t`Pull configured tables and reports from StarRez, upload CSV snapshots, and merge report updates into PostgreSQL.`}
+          {t`Pull configured tables and reports from StarRez, upload CSV snapshots, and update PostgreSQL report tables.`}
         </Text>
 
         <Flex gap="md" align="center">
@@ -236,7 +236,7 @@ function ExportSection() {
 
         {exportResult?.merge && (
           <Stack gap="sm">
-            <Title order={4}>{t`Cumulative Report Merge`}</Title>
+            <Title order={4}>{t`Report Database Updates`}</Title>
             {exportResult.merge.destination_table && (
               <Text size="sm" c="text-secondary">
                 {t`Destination table: ${exportResult.merge.destination_table}`}
@@ -247,30 +247,42 @@ function ExportSection() {
                 {exportResult.merge.metadata_sync.error}
               </Alert>
             )}
-            {exportResult.merge.reports.map((report) => (
-              <Paper key={report.report_id} withBorder p="md">
-                <Stack gap={4}>
-                  <Group gap="sm">
-                    <Badge variant="light">{t`Report`}</Badge>
-                    <Title order={5}>{report.report_id}</Title>
-                    <Badge color={report.error ? "error" : "success"}>
-                      {report.error ? t`Failed` : t`Merged`}
-                    </Badge>
-                  </Group>
-                  {report.error ? (
-                    <Text size="sm" c="error">
-                      {report.error}
+            {exportResult.merge.reports.map((report) => {
+              const statusLabel = report.error
+                ? t`Failed`
+                : report.created_table
+                  ? t`Created`
+                  : t`Merged`;
+
+              return (
+                <Paper key={report.report_id} withBorder p="md">
+                  <Stack gap={4}>
+                    <Group gap="sm">
+                      <Badge variant="light">{t`Report`}</Badge>
+                      <Title order={5}>{report.report_id}</Title>
+                      <Badge color={report.error ? "error" : "success"}>
+                        {statusLabel}
+                      </Badge>
+                    </Group>
+                    <Text size="sm" c="text-secondary" ff="monospace">
+                      {report.destination_table}
                     </Text>
-                  ) : (
-                    <Text size="sm" c="text-secondary">
-                      {t`Updated: ${report.updated?.toLocaleString() ?? "0"}`} •{" "}
-                      {t`Inserted: ${report.inserted?.toLocaleString() ?? "0"}`}{" "}
-                      • {t`New columns: ${report.added_columns?.length ?? 0}`}
-                    </Text>
-                  )}
-                </Stack>
-              </Paper>
-            ))}
+                    {report.error ? (
+                      <Text size="sm" c="error">
+                        {report.error}
+                      </Text>
+                    ) : (
+                      <Text size="sm" c="text-secondary">
+                        {t`Updated: ${report.updated?.toLocaleString() ?? "0"}`}{" "}
+                        •{" "}
+                        {t`Inserted: ${report.inserted?.toLocaleString() ?? "0"}`}{" "}
+                        • {t`New columns: ${report.added_columns?.length ?? 0}`}
+                      </Text>
+                    )}
+                  </Stack>
+                </Paper>
+              );
+            })}
           </Stack>
         )}
       </Stack>

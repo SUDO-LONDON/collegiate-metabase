@@ -1,11 +1,13 @@
 (ns metabase.starrez.db-test
   (:require
    [clojure.test :refer :all]
-   [metabase.starrez.db :as starrez.db]))
+   [metabase.starrez.db :as starrez.db]
+   [metabase.sync.sync-metadata :as sync-metadata]
+   [next.jdbc :as jdbc]))
 
 (deftest load-snapshot-tables-loads-single-report-into-preview-only
   (let [loaded (atom [])]
-    (with-redefs [metabase.starrez.db/create-and-load-table!
+    (with-redefs [starrez.db/create-and-load-table!
                   (fn [_conn table-name csv-rows]
                     (swap! loaded conj [table-name csv-rows])
                     {:table table-name})]
@@ -21,7 +23,7 @@
 
 (deftest load-snapshot-tables-keeps-non-report-tables-named
   (let [loaded (atom [])]
-    (with-redefs [metabase.starrez.db/create-and-load-table!
+    (with-redefs [starrez.db/create-and-load-table!
                   (fn [_conn table-name csv-rows]
                     (swap! loaded conj [table-name csv-rows])
                     {:table table-name})]
@@ -37,7 +39,7 @@
 
 (deftest load-snapshot-tables-keeps-report-preview-separate-from-named-tables
   (let [loaded (atom [])]
-    (with-redefs [metabase.starrez.db/create-and-load-table!
+    (with-redefs [starrez.db/create-and-load-table!
                   (fn [_conn table-name _csv-rows]
                     (swap! loaded conj table-name)
                     {:table table-name})]
@@ -96,40 +98,40 @@
        (#'starrez.db/prepare-report-csv
         [["Entry ID"] ["123"]]))))
 
-(deftest merge-report-exports-applies-newer-reports-last
+(deftest merge-report-exports-routes-each-report-to-its-own-table
   (let [merged (atom [])]
-    (with-redefs [metabase.starrez.db/merge-report-csv!
+    (with-redefs [starrez.db/merge-report-csv!
                   (fn [destination-table report-id _csv-body]
                     (swap! merged conj [destination-table report-id])
                     {:report_id report-id})
-                  metabase.starrez.db/sync-metabase-schema!
+                  starrez.db/sync-metabase-schema!
                   (constantly {:synced true})]
-      (is (= {:destination_table "starrez_data.table_59906"
-              :reports           [{:report_id "59906"}
-                                  {:report_id "62751"}]
-              :metadata_sync     {:synced true}}
+      (is (= {:destination_tables ["starrez_data.table_59906" "starrez_data.table_62751"]
+              :reports            [{:report_id "59906"}
+                                   {:report_id "62751"}]
+              :metadata_sync      {:synced true}}
              (starrez.db/merge-report-exports!
               ["59906" "62751"]
               [{:name "62751" :success true :csv_body "newer"}
                {:name "59906" :success true :csv_body "older"}])))
       (is (= [["table_59906" "59906"]
-              ["table_59906" "62751"]]
+              ["table_62751" "62751"]]
              @merged)))))
 
 (deftest merge-report-exports-keeps-going-after-a-failed-report
   (let [merged (atom [])]
-    (with-redefs [metabase.starrez.db/merge-report-csv!
+    (with-redefs [starrez.db/merge-report-csv!
                   (fn [_destination-table report-id _csv-body]
                     (swap! merged conj report-id)
                     {:report_id report-id})
-                  metabase.starrez.db/sync-metabase-schema!
+                  starrez.db/sync-metabase-schema!
                   (constantly {:synced true})]
-      (is (= {:destination_table "starrez_data.table_59906"
-              :reports           [{:report_id         "59906"
-                                   :destination_table "starrez_data.table_59906"
-                                   :error             "StarRez unavailable"}
-                                  {:report_id "62751"}]
-              :metadata_sync     {:synced true}}
+      (is (= {:destination_tables ["starrez_data.table_59906" "starrez_data.table_62751"]
+              :reports            [{:report_id         "59906"
+                                    :destination_table "starrez_data.table_59906"
+                                    :error             "StarRez unavailable"}
+                                   {:report_id "62751"}]
+              :metadata_sync      {:synced true}}
              (starrez.db/merge-report-exports!
               ["59906" "62751"]
               [{:name "59906" :success false :error "StarRez unavailable"}
@@ -138,7 +140,7 @@
 
 (deftest merge-staging-table-updates-matches-and-inserts-only-new-bookings
   (let [queries (atom [])]
-    (with-redefs [metabase.starrez.db/query-count
+    (with-redefs [starrez.db/query-count
                   (fn [_conn [sql]]
                     (swap! queries conj sql)
                     (count @queries))]
@@ -156,7 +158,7 @@
 
 (deftest ensure-booking-id-index-creates-a-unique-index
   (let [queries (atom [])]
-    (with-redefs [next.jdbc/execute!
+    (with-redefs [jdbc/execute!
                   (fn [_conn [sql]]
                     (swap! queries conj sql))]
       (#'starrez.db/ensure-booking-id-index! nil "table_59906")
@@ -165,9 +167,9 @@
 
 (deftest sync-metabase-schema-syncs-matched-database
   (let [synced (atom [])]
-    (with-redefs [metabase.starrez.db/starrez-metabase-database
+    (with-redefs [starrez.db/starrez-metabase-database
                   (constantly {:id 2 :name "StarRez"})
-                  metabase.sync.sync-metadata/sync-db-metadata!
+                  sync-metadata/sync-db-metadata!
                   (fn [database]
                     (swap! synced conj database)
                     {:ok true})]
@@ -179,7 +181,7 @@
 (deftest refresh-snapshots-refreshes-list-and-schema
   (with-redefs [starrez.db/list-weeks-result
                 (constantly {:weeks [{:id 7}]})
-                metabase.starrez.db/sync-metabase-schema!
+                starrez.db/sync-metabase-schema!
                 (constantly {:database_id 2
                              :synced true})]
     (is (= {:weeks [{:id 7}]
@@ -190,7 +192,7 @@
 (deftest refresh-snapshots-keeps-list-when-schema-sync-fails
   (with-redefs [starrez.db/list-weeks-result
                 (constantly {:weeks [{:id 7}]})
-                metabase.starrez.db/sync-metabase-schema!
+                starrez.db/sync-metabase-schema!
                 (constantly {:synced false
                              :error "No matching Metabase database found"})]
     (is (= {:weeks [{:id 7}]

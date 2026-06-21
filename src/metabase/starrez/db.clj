@@ -318,7 +318,7 @@
          {:builder-fn rs/as-unqualified-lower-maps})))
 
 (defn- prepare-report-csv
-  "Validate and normalize a report CSV for cumulative merging."
+  "Validate and normalize a report CSV for merging."
   [csv-rows]
   (let [headers      (first csv-rows)
         _            (when-not (seq headers)
@@ -370,10 +370,10 @@
                                             " GROUP BY " booking-col
                                             " HAVING COUNT(*) > 1) duplicate_booking_ids")])]
     (when (pos? blank-count)
-      (throw (ex-info "Cumulative destination contains blank booking_id values"
+      (throw (ex-info "Report destination contains blank booking_id values"
                       {:blank_booking_ids blank-count})))
     (when (pos? duplicates)
-      (throw (ex-info "Cumulative destination contains duplicate booking_id values"
+      (throw (ex-info "Report destination contains duplicate booking_id values"
                       {:duplicate_booking_ids duplicates})))))
 
 (defn- normalize-destination-booking-ids! [conn table-name]
@@ -391,13 +391,6 @@
     (jdbc/execute! conn [(str "CREATE UNIQUE INDEX IF NOT EXISTS "
                               (quote-ident index-name)
                               " ON " tbl " (" booking-col ")")])))
-
-(defn- ensure-cumulative-table! [conn table-name columns]
-  (if (table-exists? conn table-name)
-    (add-missing-columns! conn table-name columns)
-    (do
-      (create-table! conn table-name columns)
-      columns)))
 
 (defn- create-staging-table! [conn columns]
   (let [table-name (str "starrez_report_merge_" (str/replace (str (random-uuid)) "-" ""))
@@ -434,6 +427,30 @@
     {:inserted insert-result
      :updated  update-result}))
 
+(defn- create-and-load-report-table! [conn destination-table columns rows]
+  (let [destination (qualified-table-name data-schema destination-table)]
+    (create-table! conn destination-table columns)
+    (when (seq rows)
+      (copy-rows! conn destination columns rows))
+    (ensure-booking-id-index! conn destination-table)
+    {:added_columns columns
+     :created_table true
+     :inserted      (count rows)
+     :updated       0}))
+
+(defn- merge-existing-report-table! [conn destination-table columns rows]
+  (let [added-columns (add-missing-columns! conn destination-table columns)
+        _             (normalize-destination-booking-ids! conn destination-table)
+        _             (assert-valid-destination-booking-ids! conn destination-table)
+        _             (ensure-booking-id-index! conn destination-table)
+        staging-table (create-staging-table! conn columns)
+        _             (when (seq rows)
+                        (copy-rows! conn staging-table columns rows))
+        result        (merge-staging-table! conn destination-table staging-table columns)]
+    (merge {:added_columns added-columns
+            :created_table false}
+           result)))
+
 (defn- merge-report-csv!
   [destination-table report-id csv-body]
   (try
@@ -442,49 +459,53 @@
         (.setAutoCommit conn false)
         (try
           (set-activation-timeouts! conn)
-          (let [added-columns (ensure-cumulative-table! conn destination-table columns)
-                _             (normalize-destination-booking-ids! conn destination-table)
-                _             (assert-valid-destination-booking-ids! conn destination-table)
-                _             (ensure-booking-id-index! conn destination-table)
-                staging-table (create-staging-table! conn columns)
-                _             (when (seq rows)
-                                (copy-rows! conn staging-table columns rows))
-                result        (merge-staging-table! conn destination-table staging-table columns)]
+          (let [table-exists? (table-exists? conn destination-table)
+                result        (if table-exists?
+                                (merge-existing-report-table! conn destination-table columns rows)
+                                (create-and-load-report-table! conn destination-table columns rows))]
             (.commit conn)
             (merge {:report_id         report-id
-                    :destination_table (str data-schema "." destination-table)
-                    :added_columns     added-columns}
+                    :destination_table (str data-schema "." destination-table)}
                    result))
           (catch Exception e
             (.rollback conn)
             (throw e)))))
     (catch Exception e
-      (log/errorf e "Failed to merge StarRez report %s into cumulative table %s" report-id destination-table)
+      (log/errorf e "Failed to merge StarRez report %s into report table %s" report-id destination-table)
       {:report_id         report-id
        :destination_table (str data-schema "." destination-table)
        :error             (ex-message e)})))
 
+(defn- report-destination-table [report-id]
+  (safe-table-name report-id))
+
+(defn- qualified-report-destination-table [report-id]
+  (str data-schema "." (report-destination-table report-id)))
+
+(defn- report-merge-error [report-id error]
+  {:report_id         report-id
+   :destination_table (qualified-report-destination-table report-id)
+   :error             error})
+
 (defn merge-report-exports!
-  "Merge successful report CSVs into the earliest report-ID table.
-  Reports are applied in first-seen order so newer reports win conflicts."
+  "Merge each successful report CSV into its own report-ID table."
   [ordered-report-ids report-results]
-  (let [destination-table (some-> ordered-report-ids first safe-table-name)
-        results-by-id     (into {} (map (juxt :name identity)) report-results)
-        merges            (when destination-table
-                            (mapv (fn [report-id]
-                                    (if-let [result (get results-by-id report-id)]
-                                      (if (and (:success result) (seq (:csv_body result)))
-                                        (merge-report-csv! destination-table report-id (:csv_body result))
-                                        {:report_id         report-id
-                                         :destination_table (str data-schema "." destination-table)
-                                         :error             (or (:error result) "Report export failed")})
-                                      {:report_id         report-id
-                                       :destination_table (str data-schema "." destination-table)
-                                       :error             "Report export result missing"}))
-                                  ordered-report-ids))]
-    {:destination_table (when destination-table (str data-schema "." destination-table))
-     :reports           (or merges [])
-     :metadata_sync     (when destination-table (sync-metabase-schema!))}))
+  (let [results-by-id       (into {} (map (juxt :name identity)) report-results)
+        all-destination-tables (mapv qualified-report-destination-table ordered-report-ids)
+        merges              (mapv (fn [report-id]
+                                    (let [destination-table (report-destination-table report-id)]
+                                      (if-let [result (get results-by-id report-id)]
+                                        (if (and (:success result) (seq (:csv_body result)))
+                                          (merge-report-csv! destination-table report-id (:csv_body result))
+                                          (report-merge-error report-id (or (:error result) "Report export failed")))
+                                        (report-merge-error report-id "Report export result missing"))))
+                                  ordered-report-ids)
+        successful-merge?   (some #(not (:error %)) merges)
+        destination-tables  (distinct-in-order all-destination-tables)]
+    (cond-> {:reports merges}
+      (= 1 (count destination-tables)) (assoc :destination_table (first destination-tables))
+      (seq destination-tables)         (assoc :destination_tables destination-tables)
+      successful-merge?                (assoc :metadata_sync (sync-metabase-schema!)))))
 
 (defn- read-csv [^String csv-str]
   (with-open [r (StringReader. csv-str)]

@@ -68,11 +68,13 @@ export interface StarRezReportMergeResult {
   inserted?: number;
   updated?: number;
   added_columns?: string[];
+  created_table?: boolean;
   error?: string;
 }
 
 export interface StarRezCumulativeMergeResult {
   destination_table?: string;
+  destination_tables?: string[];
   reports: StarRezReportMergeResult[];
   metadata_sync?: StarRezMetadataSyncResult;
 }
