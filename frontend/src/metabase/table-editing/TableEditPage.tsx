@@ -2,16 +2,18 @@ import type { CSSProperties } from "react";
 import { useMemo, useState } from "react";
 import { t } from "ttag";
 
+import { skipToken } from "metabase/api/api";
+import { useGetDatabaseQuery } from "metabase/api/database";
 import {
-  skipToken,
-  useCreateTableRowMutation,
-  useDeleteTableRowMutation,
-  useGetDatabaseQuery,
   useGetTableDataQuery,
   useGetTableQuery,
   useGetTableQueryMetadataQuery,
+} from "metabase/api/table";
+import {
+  useCreateTableRowMutation,
+  useDeleteTableRowMutation,
   useUpdateTableRowMutation,
-} from "metabase/api";
+} from "metabase/api/table-editing";
 import { getErrorMessage } from "metabase/api/utils/errors";
 import { BrowserCrumbs } from "metabase/common/components/BrowserCrumbs";
 import { GenericError } from "metabase/common/components/ErrorPages";

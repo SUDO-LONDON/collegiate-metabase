@@ -10,7 +10,7 @@ import {
   DatabaseInfoSection,
   DatabaseInfoSectionDivider,
 } from "metabase/admin/databases/components/DatabaseInfoSection";
-import { useGetDatabaseMetadataQuery } from "metabase/api";
+import { useGetDatabaseMetadataQuery } from "metabase/api/database";
 import { Toggle } from "metabase/common/components/Toggle";
 import { hasDbRoutingEnabled } from "metabase/common/utils/database";
 import { ALLOWED_ENGINES_FOR_TABLE_EDITING } from "metabase/databases/constants";

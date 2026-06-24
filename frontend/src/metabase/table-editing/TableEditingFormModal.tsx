@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { t } from "ttag";
 
-import { useDescribeTableEditFormMutation } from "metabase/api";
+import { useDescribeTableEditFormMutation } from "metabase/api/table-editing";
 import { getErrorMessage } from "metabase/api/utils/errors";
 import {
   Alert,
