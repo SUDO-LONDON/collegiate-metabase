@@ -16,7 +16,8 @@ import { getErrorMessage } from "metabase/api/utils/errors";
 import { BrowserCrumbs } from "metabase/common/components/BrowserCrumbs";
 import { GenericError } from "metabase/common/components/ErrorPages";
 import { LoadingAndErrorWrapper } from "metabase/common/components/LoadingAndErrorWrapper";
-import { useCloseNavbarOnMount, useToast } from "metabase/common/hooks";
+import { useToast } from "metabase/common/hooks";
+import { useCloseNavbarOnMount } from "metabase/common/hooks/use-close-navbar-on-mount";
 import { useSelector } from "metabase/redux";
 import { getUserIsAdmin } from "metabase/selectors/user";
 import {
