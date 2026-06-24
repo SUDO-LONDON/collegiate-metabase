@@ -41,7 +41,6 @@
 (setting/defsetting database-enable-table-editing
   (i18n/deferred-tru "Whether the Database has table data editing enabled.")
   :default          false
-  :feature          :table-data-editing
   :driver-feature   :actions/data-editing
   :enabled-for-db? (fn [db]
                      (setting/custom-disabled-reasons!

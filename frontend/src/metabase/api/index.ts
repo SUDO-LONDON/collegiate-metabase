@@ -49,6 +49,7 @@ export * from "./snippet";
 export * from "./starrez";
 export * from "./subscription";
 export * from "./table";
+export * from "./table-editing";
 export * from "./task";
 export * from "./timeline";
 export * from "./timeline-event";

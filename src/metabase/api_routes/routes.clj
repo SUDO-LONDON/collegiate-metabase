@@ -54,9 +54,10 @@
    [metabase.session.api]
    [metabase.settings-rest.api]
    [metabase.setup-rest.api]
-   [metabase.starrez.api]
    [metabase.sso.api]
+   [metabase.starrez.api]
    [metabase.sync.api]
+   [metabase.table-editing.api]
    [metabase.task-history.api]
    [metabase.testing-api.api]
    [metabase.testing-api.core]
@@ -110,6 +111,7 @@
          metabase.settings-rest.api/keep-me
          metabase.setup-rest.api/keep-me
          metabase.starrez.api/keep-me
+         metabase.table-editing.api/keep-me
          metabase.task-history.api/keep-me
          metabase.testing-api.api/keep-me
          metabase.tiles.api/keep-me
@@ -221,6 +223,7 @@
    "/slack"                (+auth metabase.channel.api/slack-routes)
    "/starrez"              (+auth 'metabase.starrez.api)
    "/table"                (+auth metabase.warehouse-schema-rest.api/table-routes)
+   "/table-editing"        (+auth 'metabase.table-editing.api)
    "/task"                 (+auth 'metabase.task-history.api)
    "/testing"              (if metabase.testing-api.core/enable-testing-routes? 'metabase.testing-api.api pass-thru-handler)
    "/tiles"                (+auth 'metabase.tiles.api)

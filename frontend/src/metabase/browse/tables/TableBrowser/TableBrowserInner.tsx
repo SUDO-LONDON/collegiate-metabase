@@ -76,6 +76,7 @@ export const TableBrowserInner = ({
           <TableBrowserItem
             key={table.id}
             table={table}
+            database={database as Database | undefined}
             dbId={dbId}
             getTableUrl={getTableUrl}
             xraysEnabled={xraysEnabled}
@@ -90,6 +91,7 @@ export const TableBrowserInner = ({
 
 type TableBrowserItemProps = {
   table: Table;
+  database?: Database;
   dbId: DatabaseId;
   xraysEnabled?: boolean;
   metadata?: Metadata;
@@ -99,6 +101,7 @@ type TableBrowserItemProps = {
 
 const TableBrowserItem = ({
   table,
+  database,
   dbId,
   xraysEnabled,
   metadata,
@@ -123,7 +126,14 @@ const TableBrowserItem = ({
             tableId={table.id as ConcreteTableId}
             dbId={dbId}
             xraysEnabled={xraysEnabled}
-            canEditTables={canEditTables && isTableWritable}
+            canEditTables={
+              canEditTables &&
+              isTableWritable &&
+              PLUGIN_TABLE_EDITING.isTableEditable?.(
+                database,
+                table.id as ConcreteTableId,
+              )
+            }
           />
         )}
       </>

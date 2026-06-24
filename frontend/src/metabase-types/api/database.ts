@@ -10,6 +10,8 @@ export type InitialSyncStatus = LongTaskStatus;
 export type DatabaseSettings = {
   [key: string]: any;
   "database-enable-actions"?: boolean;
+  "database-enable-table-editing"?: boolean;
+  "database-editable-table-ids"?: number[] | string[];
 };
 
 export type DatabaseFeature =
