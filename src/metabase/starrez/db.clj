@@ -34,6 +34,7 @@
 (def ^:private meta-schema "starrez_meta")
 (def ^:private active-report-table "active_report")
 (def ^:private report-merge-key "booking_id")
+(def ^:private technical-row-id-column "_metabase_row_id")
 (def ^:private postgres-max-columns 1600)
 
 (defn- configured? []
@@ -259,27 +260,42 @@
       {:synced false
        :error  (ex-message e)})))
 
+(declare ensure-known-report-table-primary-keys!)
+
 (defn refresh-snapshots!
   "Return the latest StarRez snapshots and synchronously refresh the Metabase
   metadata for the configured StarRez Postgres database."
   []
+  (when (configured?)
+    (ensure-known-report-table-primary-keys!))
   (assoc (list-weeks-result)
          :metadata_sync (sync-metabase-schema!)))
 
-(defn- unique-column-names [headers]
-  (loop [names (map safe-column-name headers)
-         seen  {}
-         out   []]
-    (if-let [column-name (first names)]
-      (let [n           (inc (get seen column-name 0))
-            unique-name (if (= n 1) column-name (str column-name "_" n))]
-        (recur (rest names)
-               (assoc seen column-name n)
-               (conj out unique-name)))
-      out)))
+(defn- unique-column-names
+  ([headers]
+   (unique-column-names headers #{}))
+  ([headers reserved-names]
+   (loop [names (map safe-column-name headers)
+          seen  {}
+          used  (set reserved-names)
+          out   []]
+     (if-let [column-name (first names)]
+       (let [[n unique-name] (loop [n (inc (get seen column-name 0))]
+                               (let [candidate (if (= n 1) column-name (str column-name "_" n))]
+                                 (if (contains? used candidate)
+                                   (recur (inc n))
+                                   [n candidate])))]
+         (recur (rest names)
+                (assoc seen column-name n)
+                (conj used unique-name)
+                (conj out unique-name)))
+       out))))
 
 (defn- quote-ident [s]
   (str "\"" (str/replace (str s) "\"" "\"\"") "\""))
+
+(defn- quote-literal [s]
+  (str "'" (str/replace (str s) "'" "''") "'"))
 
 (defn- qualified-table-name [schema table]
   (str (quote-ident schema) "." (quote-ident table)))
@@ -317,6 +333,47 @@
           table-name]
          {:builder-fn rs/as-unqualified-lower-maps})))
 
+(defn- table-has-primary-key? [conn table-name]
+  (:exists
+   (jdbc/execute-one!
+    conn
+    ["SELECT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE table_schema = ? AND table_name = ? AND constraint_type = 'PRIMARY KEY') AS exists"
+     data-schema
+     table-name]
+    {:builder-fn rs/as-unqualified-lower-maps})))
+
+(defn- available-technical-row-id-column [existing-columns]
+  (loop [n 1]
+    (let [column-name (if (= n 1) technical-row-id-column (str technical-row-id-column "_" n))]
+      (if (contains? existing-columns column-name)
+        (recur (inc n))
+        column-name))))
+
+(defn- ensure-technical-primary-key! [conn table-name]
+  (when-not (table-has-primary-key? conn table-name)
+    (let [existing-columns (set (table-columns conn table-name))
+          row-id-column   (available-technical-row-id-column existing-columns)
+          tbl             (qualified-table-name data-schema table-name)
+          quoted-column   (quote-ident row-id-column)
+          sequence-name   (safe-ident-name (str table-name "_" row-id-column "_seq") "sequence")
+          sequence        (qualified-table-name data-schema sequence-name)
+          sequence-ref    (quote-literal (str data-schema "." sequence-name))]
+      (jdbc/execute! conn [(str "ALTER TABLE " tbl " ADD COLUMN " quoted-column " BIGINT")])
+      (jdbc/execute! conn [(str "CREATE SEQUENCE IF NOT EXISTS " sequence)])
+      (jdbc/execute! conn [(str "UPDATE " tbl
+                                " SET " quoted-column " = nextval(" sequence-ref "::regclass)"
+                                " WHERE " quoted-column " IS NULL")])
+      (jdbc/execute! conn [(str "SELECT setval(" sequence-ref "::regclass,"
+                                " COALESCE((SELECT MAX(" quoted-column ") FROM " tbl "), 0) + 1,"
+                                " false)")])
+      (jdbc/execute! conn [(str "ALTER TABLE " tbl
+                                " ALTER COLUMN " quoted-column
+                                " SET DEFAULT nextval(" sequence-ref "::regclass)")])
+      (jdbc/execute! conn [(str "ALTER TABLE " tbl " ALTER COLUMN " quoted-column " SET NOT NULL")])
+      (jdbc/execute! conn [(str "ALTER TABLE " tbl " ADD PRIMARY KEY (" quoted-column ")")])
+      (jdbc/execute! conn [(str "ALTER SEQUENCE " sequence " OWNED BY " tbl "." quoted-column)])
+      row-id-column)))
+
 (defn- parse-report-csv
   "Parse and normalize a report CSV. Returns booking_id analysis so callers can
   decide whether the report can be merged or must be loaded by replacement."
@@ -324,7 +381,7 @@
   (let [headers      (first csv-rows)
         _            (when-not (seq headers)
                        (throw (ex-info "CSV has no header row" {})))
-        columns      (unique-column-names headers)
+        columns      (unique-column-names headers #{technical-row-id-column})
         _            (when (> (count columns) postgres-max-columns)
                        (throw (ex-info (format "CSV has %d columns after parsing, which exceeds Postgres limit %d"
                                                (count columns)
@@ -373,9 +430,10 @@
     :else              {:mode :merge}))
 
 (defn- create-table! [conn table-name columns]
-  (let [tbl     (qualified-table-name data-schema table-name)
-        col-ddl (str/join ", " (map #(str (quote-ident %) " TEXT") columns))]
-    (jdbc/execute! conn [(str "CREATE TABLE " tbl " (" col-ddl ")")])))
+  (let [tbl        (qualified-table-name data-schema table-name)
+        row-id-ddl (str (quote-ident technical-row-id-column) " BIGSERIAL PRIMARY KEY")
+        col-ddl    (map #(str (quote-ident %) " TEXT") columns)]
+    (jdbc/execute! conn [(str "CREATE TABLE " tbl " (" (str/join ", " (cons row-id-ddl col-ddl)) ")")])))
 
 (defn- add-missing-columns! [conn table-name source-columns]
   (let [tbl           (qualified-table-name data-schema table-name)
@@ -482,6 +540,7 @@
 
 (defn- merge-existing-report-table! [conn destination-table columns rows]
   (let [added-columns (add-missing-columns! conn destination-table columns)
+        _             (ensure-technical-primary-key! conn destination-table)
         _             (normalize-destination-booking-ids! conn destination-table)
         _             (assert-valid-destination-booking-ids! conn destination-table)
         _             (ensure-booking-id-index! conn destination-table)
@@ -530,6 +589,24 @@
 
 (defn- qualified-report-destination-table [report-id]
   (str data-schema "." (report-destination-table report-id)))
+
+(defn- ensure-known-report-table-primary-keys! []
+  (try
+    (let [destination-tables (distinct-in-order (map report-destination-table (report-ids-for-export [])))]
+      (when (seq destination-tables)
+        (with-open [conn (get-connection)]
+          (doseq [destination-table destination-tables]
+            (try
+              (when (table-exists? conn destination-table)
+                (when-let [row-id-column (ensure-technical-primary-key! conn destination-table)]
+                  (log/infof "Added technical primary key %s to StarRez report table %s"
+                             row-id-column
+                             destination-table)))
+              (catch Exception e
+                (log/warnf e "Failed to ensure technical primary key for StarRez report table %s"
+                           destination-table)))))))
+    (catch Exception e
+      (log/warn e "Failed to ensure StarRez report table primary keys before metadata sync"))))
 
 (defn- report-merge-error [report-id error]
   {:report_id         report-id

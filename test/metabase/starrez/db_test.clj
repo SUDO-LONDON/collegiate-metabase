@@ -1,5 +1,6 @@
 (ns metabase.starrez.db-test
   (:require
+   [clojure.string :as str]
    [clojure.test :refer :all]
    [metabase.starrez.db :as starrez.db]
    [metabase.sync.sync-metadata :as sync-metadata]
@@ -176,6 +177,87 @@
       (is (re-find #"WHERE NOT EXISTS" (second @queries)))
       (is (re-find #"destination\.\"booking_id\" = staging\.\"booking_id\"" (second @queries))))))
 
+(deftest create-report-table-adds-technical-primary-key
+  (let [queries (atom [])]
+    (with-redefs [jdbc/execute!
+                  (fn [_conn [sql]]
+                    (swap! queries conj sql))]
+      (#'starrez.db/create-table! nil "table_59906" ["booking_id" "room"])
+      (is (= ["CREATE TABLE \"starrez_data\".\"table_59906\" (\"_metabase_row_id\" BIGSERIAL PRIMARY KEY, \"booking_id\" TEXT, \"room\" TEXT)"]
+             @queries)))))
+
+(deftest ensure-technical-primary-key-adds-row-id-to-existing-report-table
+  (let [queries (atom [])]
+    (with-redefs [jdbc/execute-one!
+                  (fn [_conn [sql & _params] & _opts]
+                    (when (str/includes? sql "information_schema.table_constraints")
+                      {:exists false}))
+                  jdbc/execute!
+                  (fn [_conn [sql & _params] & _opts]
+                    (if (str/includes? sql "information_schema.columns")
+                      []
+                      (swap! queries conj sql)))]
+      (is (= "_metabase_row_id"
+             (#'starrez.db/ensure-technical-primary-key! nil "table_59906")))
+      (is (= ["ALTER TABLE \"starrez_data\".\"table_59906\" ADD COLUMN \"_metabase_row_id\" BIGINT"
+              "CREATE SEQUENCE IF NOT EXISTS \"starrez_data\".\"table_59906_metabase_row_id_seq\""
+              "UPDATE \"starrez_data\".\"table_59906\" SET \"_metabase_row_id\" = nextval('starrez_data.table_59906_metabase_row_id_seq'::regclass) WHERE \"_metabase_row_id\" IS NULL"
+              "SELECT setval('starrez_data.table_59906_metabase_row_id_seq'::regclass, COALESCE((SELECT MAX(\"_metabase_row_id\") FROM \"starrez_data\".\"table_59906\"), 0) + 1, false)"
+              "ALTER TABLE \"starrez_data\".\"table_59906\" ALTER COLUMN \"_metabase_row_id\" SET DEFAULT nextval('starrez_data.table_59906_metabase_row_id_seq'::regclass)"
+              "ALTER TABLE \"starrez_data\".\"table_59906\" ALTER COLUMN \"_metabase_row_id\" SET NOT NULL"
+              "ALTER TABLE \"starrez_data\".\"table_59906\" ADD PRIMARY KEY (\"_metabase_row_id\")"
+              "ALTER SEQUENCE \"starrez_data\".\"table_59906_metabase_row_id_seq\" OWNED BY \"starrez_data\".\"table_59906\".\"_metabase_row_id\""]
+             @queries)))))
+
+(deftest merge-existing-report-table-ensures-technical-primary-key
+  (let [calls (atom [])]
+    (with-redefs [starrez.db/add-missing-columns!
+                  (fn [_conn table-name columns]
+                    (swap! calls conj [:add-missing table-name columns])
+                    [])
+                  starrez.db/ensure-technical-primary-key!
+                  (fn [_conn table-name]
+                    (swap! calls conj [:ensure-primary-key table-name]))
+                  starrez.db/normalize-destination-booking-ids!
+                  (fn [_conn table-name]
+                    (swap! calls conj [:normalize table-name]))
+                  starrez.db/assert-valid-destination-booking-ids!
+                  (fn [_conn table-name]
+                    (swap! calls conj [:assert-valid table-name]))
+                  starrez.db/ensure-booking-id-index!
+                  (fn [_conn table-name]
+                    (swap! calls conj [:ensure-booking-index table-name]))
+                  starrez.db/create-staging-table!
+                  (fn [_conn columns]
+                    (swap! calls conj [:create-staging columns])
+                    "\"staging\"")
+                  starrez.db/copy-rows!
+                  (fn [_conn table-name columns rows]
+                    (swap! calls conj [:copy table-name columns rows]))
+                  starrez.db/merge-staging-table!
+                  (fn [_conn destination-table staging-table columns]
+                    (swap! calls conj [:merge destination-table staging-table columns])
+                    {:inserted 0
+                     :updated  1})]
+      (is (= {:added_columns []
+              :created_table false
+              :inserted      0
+              :updated       1}
+             (#'starrez.db/merge-existing-report-table!
+              nil
+              "table_59906"
+              ["booking_id" "room"]
+              [["123" "A"]])))
+      (is (= [[:add-missing "table_59906" ["booking_id" "room"]]
+              [:ensure-primary-key "table_59906"]
+              [:normalize "table_59906"]
+              [:assert-valid "table_59906"]
+              [:ensure-booking-index "table_59906"]
+              [:create-staging ["booking_id" "room"]]
+              [:copy "\"staging\"" ["booking_id" "room"] [["123" "A"]]]
+              [:merge "table_59906" "\"staging\"" ["booking_id" "room"]]]
+             @calls)))))
+
 (deftest ensure-booking-id-index-creates-a-unique-index
   (let [queries (atom [])]
     (with-redefs [jdbc/execute!
@@ -199,19 +281,28 @@
       (is (= [{:id 2 :name "StarRez"}] @synced)))))
 
 (deftest refresh-snapshots-refreshes-list-and-schema
-  (with-redefs [starrez.db/list-weeks-result
-                (constantly {:weeks [{:id 7}]})
-                starrez.db/sync-metabase-schema!
-                (constantly {:database_id 2
-                             :synced true})]
-    (is (= {:weeks [{:id 7}]
-            :metadata_sync {:database_id 2
-                            :synced true}}
-           (starrez.db/refresh-snapshots!)))))
+  (let [repaired? (atom false)]
+    (with-redefs [starrez.db/configured?
+                  (constantly true)
+                  starrez.db/ensure-known-report-table-primary-keys!
+                  (fn []
+                    (reset! repaired? true))
+                  starrez.db/list-weeks-result
+                  (constantly {:weeks [{:id 7}]})
+                  starrez.db/sync-metabase-schema!
+                  (constantly {:database_id 2
+                               :synced true})]
+      (is (= {:weeks [{:id 7}]
+              :metadata_sync {:database_id 2
+                              :synced true}}
+             (starrez.db/refresh-snapshots!)))
+      (is (true? @repaired?)))))
 
 (deftest refresh-snapshots-keeps-list-when-schema-sync-fails
   (with-redefs [starrez.db/list-weeks-result
                 (constantly {:weeks [{:id 7}]})
+                starrez.db/configured?
+                (constantly false)
                 starrez.db/sync-metabase-schema!
                 (constantly {:synced false
                              :error "No matching Metabase database found"})]
