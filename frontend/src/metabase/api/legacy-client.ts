@@ -5,11 +5,12 @@ import querystring from "querystring";
 import { substituteUrlTags } from "metabase/api/utils/substitute-url-tags";
 import { isEmbeddingSdk } from "metabase/embedding-sdk/config";
 import { isTest } from "metabase/env";
-import { PLUGIN_API, PLUGIN_EMBEDDING_SDK } from "metabase/plugins";
-import type {
-  OnBeforeRequestHandler,
-  OnBeforeRequestHandlerConfig,
+import {
+  type OnBeforeRequestHandler,
+  type OnBeforeRequestHandlerConfig,
+  PLUGIN_API,
 } from "metabase/plugins/oss/api";
+import { PLUGIN_EMBEDDING_SDK } from "metabase/plugins/oss/embedding-sdk";
 import { IFRAMED_IN_SELF, isWithinIframe } from "metabase/utils/iframe";
 import { getTraceparentHeader } from "metabase/utils/otel";
 import { delay } from "metabase/utils/promise";
@@ -630,7 +631,46 @@ const instance = new LegacyApi();
 
 // eslint-disable-next-line import/no-default-export -- deprecated usage
 export default instance;
-export const { GET, POST, PUT, DELETE } = instance;
+
+function makeDeferredMethod(
+  methodName: "GET" | "POST" | "PUT" | "DELETE",
+  urlTemplate: string,
+  methodOptions?: Partial<RequestOptions>,
+): ApiMethod {
+  return (rawData, invocationOptions) =>
+    instance[methodName](urlTemplate, methodOptions)(
+      rawData,
+      invocationOptions,
+    );
+}
+
+export function GET(
+  urlTemplate: string,
+  methodOptions?: Partial<RequestOptions>,
+): ApiMethod {
+  return makeDeferredMethod("GET", urlTemplate, methodOptions);
+}
+
+export function POST(
+  urlTemplate: string,
+  methodOptions?: Partial<RequestOptions>,
+): ApiMethod {
+  return makeDeferredMethod("POST", urlTemplate, methodOptions);
+}
+
+export function PUT(
+  urlTemplate: string,
+  methodOptions?: Partial<RequestOptions>,
+): ApiMethod {
+  return makeDeferredMethod("PUT", urlTemplate, methodOptions);
+}
+
+export function DELETE(
+  urlTemplate: string,
+  methodOptions?: Partial<RequestOptions>,
+): ApiMethod {
+  return makeDeferredMethod("DELETE", urlTemplate, methodOptions);
+}
 
 export const setLocaleHeader = (locale: string | null | undefined): void => {
   /* `X-Metabase-Locale` is a header that the BE stores as *user* locale for the scope of the request.
