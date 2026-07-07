@@ -209,6 +209,47 @@
               "ALTER SEQUENCE \"starrez_data\".\"table_59906_metabase_row_id_seq\" OWNED BY \"starrez_data\".\"table_59906\".\"_metabase_row_id\""]
              @queries)))))
 
+(deftest truncate-report-table-keeps-dependent-views-intact
+  (let [queries (atom [])]
+    (with-redefs [jdbc/execute!
+                  (fn [_conn [sql]]
+                    (swap! queries conj sql))]
+      (#'starrez.db/truncate-table! nil "table_65521")
+      (is (= ["TRUNCATE TABLE \"starrez_data\".\"table_65521\" RESTART IDENTITY"]
+             @queries)))))
+
+(deftest replace-existing-report-table-does-not-drop-dependent-model-source
+  (let [calls (atom [])]
+    (with-redefs [starrez.db/add-missing-columns!
+                  (fn [_conn table-name columns]
+                    (swap! calls conj [:add-missing table-name columns])
+                    ["new_col"])
+                  starrez.db/ensure-technical-primary-key!
+                  (fn [_conn table-name]
+                    (swap! calls conj [:ensure-primary-key table-name]))
+                  starrez.db/truncate-table!
+                  (fn [_conn table-name]
+                    (swap! calls conj [:truncate table-name]))
+                  starrez.db/copy-rows!
+                  (fn [_conn table-name columns rows]
+                    (swap! calls conj [:copy table-name columns rows]))]
+      (is (= {:added_columns ["new_col"]
+              :created_table false
+              :replaced_table true
+              :inserted      1
+              :updated       0}
+             (#'starrez.db/replace-report-table!
+              nil
+              "table_65521"
+              ["booking_id" "room" "new_col"]
+              [["123" "A" "yes"]]
+              true)))
+      (is (= [[:add-missing "table_65521" ["booking_id" "room" "new_col"]]
+              [:ensure-primary-key "table_65521"]
+              [:truncate "table_65521"]
+              [:copy "\"starrez_data\".\"table_65521\"" ["booking_id" "room" "new_col"] [["123" "A" "yes"]]]]
+             @calls)))))
+
 (deftest merge-existing-report-table-ensures-technical-primary-key
   (let [calls (atom [])]
     (with-redefs [starrez.db/add-missing-columns!

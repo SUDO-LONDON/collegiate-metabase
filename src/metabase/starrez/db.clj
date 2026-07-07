@@ -521,22 +521,35 @@
      :inserted      (count rows)
      :updated       0}))
 
-(defn- drop-table! [conn table-name]
+(defn- truncate-table! [conn table-name]
   (let [destination (qualified-table-name data-schema table-name)]
-    (jdbc/execute! conn [(str "DROP TABLE IF EXISTS " destination)])))
+    (jdbc/execute! conn [(str "TRUNCATE TABLE " destination " RESTART IDENTITY")])))
 
-(defn- replace-report-table! [conn destination-table columns rows table-existed?]
-  (when table-existed?
-    (drop-table! conn destination-table))
-  (let [destination (qualified-table-name data-schema destination-table)]
-    (create-table! conn destination-table columns)
+(defn- replace-existing-report-table! [conn destination-table columns rows]
+  (let [added-columns (add-missing-columns! conn destination-table columns)
+        _             (ensure-technical-primary-key! conn destination-table)
+        destination   (qualified-table-name data-schema destination-table)]
+    (truncate-table! conn destination-table)
     (when (seq rows)
       (copy-rows! conn destination columns rows))
-    {:added_columns columns
-     :created_table (not table-existed?)
-     :replaced_table table-existed?
+    {:added_columns added-columns
+     :created_table false
+     :replaced_table true
      :inserted      (count rows)
      :updated       0}))
+
+(defn- replace-report-table! [conn destination-table columns rows table-existed?]
+  (if table-existed?
+    (replace-existing-report-table! conn destination-table columns rows)
+    (let [destination (qualified-table-name data-schema destination-table)]
+      (create-table! conn destination-table columns)
+      (when (seq rows)
+        (copy-rows! conn destination columns rows))
+      {:added_columns columns
+       :created_table true
+       :replaced_table false
+       :inserted      (count rows)
+       :updated       0})))
 
 (defn- merge-existing-report-table! [conn destination-table columns rows]
   (let [added-columns (add-missing-columns! conn destination-table columns)
