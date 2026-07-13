@@ -123,8 +123,8 @@ export function SettingsNav() {
       <NavDivider />
       <SettingsNavItem
         path="starrez"
-        label={t`StarRez Export`}
-        icon="download"
+        label={t`StarRez Data Refresh`}
+        icon="refresh"
       />
       <SettingsNavItem path="license" label={t`License`} icon="store" />
       <SettingsNavItem

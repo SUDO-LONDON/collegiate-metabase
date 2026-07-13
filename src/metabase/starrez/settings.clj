@@ -1,5 +1,6 @@
 (ns metabase.starrez.settings
   (:require
+   [clojure.string :as str]
    [metabase.settings.core :refer [defsetting]]
    [metabase.util.i18n :refer [deferred-tru]]))
 
@@ -47,6 +48,15 @@
   :visibility :admin
   :type       :string
   :default    ""
+  :audit      :getter)
+
+(defsetting starrez-auto-refresh-disabled-reports
+  (deferred-tru "StarRez report IDs excluded from automatic refresh")
+  :encryption :no
+  :visibility :admin
+  :type       :csv
+  :default    []
+  :export?    false
   :audit      :getter)
 
 (defsetting starrez-sort-field
@@ -98,3 +108,14 @@
   :visibility :admin
   :type       :integer
   :audit      :getter)
+
+(defn csv-setting-values
+  "Return a normalized vector of values from a StarRez comma-separated or CSV setting."
+  [setting-value]
+  (->> (if (sequential? setting-value)
+         setting-value
+         (str/split (or setting-value "") #","))
+       (map str)
+       (map str/trim)
+       (remove str/blank?)
+       vec))

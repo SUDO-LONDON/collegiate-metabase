@@ -13,11 +13,24 @@ export interface StarRezStatus {
   settings: {
     export_tables: string;
     export_reports: string;
+    auto_refresh_disabled_reports: string[];
     sort_field: string;
     keep_versions: number;
     pg_database: string;
     metabase_database_id: number | null;
   };
+  report_refresh: {
+    reports: StarRezAutoRefreshReport[];
+    selected_report_ids: string[];
+    disabled_report_ids: string[];
+  };
+}
+
+export interface StarRezAutoRefreshReport {
+  id: string;
+  selected: boolean;
+  configured: boolean;
+  previously_exported: boolean;
 }
 
 export interface StarRezWeek {
@@ -85,12 +98,17 @@ export interface StarRezExportResult {
   results?: StarRezExportItemResult[];
   snapshots?: number[];
   merge?: StarRezCumulativeMergeResult;
+  table_snapshot_id?: number | null;
+  activation?: StarRezActivateResult | null;
+  completed_at?: string;
   error?: string;
 }
 
 export interface StarRezRunExportRequest {
   export_tables?: string;
   export_reports?: string;
+  include_historical_reports?: boolean;
+  activate_table_snapshot?: boolean;
 }
 
 const starRezApi = Api.injectEndpoints({
@@ -116,7 +134,7 @@ const starRezApi = Api.injectEndpoints({
         url: "/api/starrez/export",
         body,
       }),
-      invalidatesTags: ["starrez-exports", "starrez-weeks"],
+      invalidatesTags: ["starrez-exports", "starrez-weeks", "starrez-status"],
     }),
 
     listStarRezExports: builder.query<

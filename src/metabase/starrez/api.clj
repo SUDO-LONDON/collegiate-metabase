@@ -16,19 +16,23 @@
   "Return current StarRez configuration status (without exposing secret values)."
   []
   (perms/check-has-application-permission :setting)
-  {:configured {:api_url      (boolean (seq (or (starrez.settings/starrez-api-url) "")))
-                :api_username (boolean (seq (or (starrez.settings/starrez-api-username) "")))
-                :api_token    (boolean (seq (or (starrez.settings/starrez-api-token) "")))
-                :blob_sas_url (boolean (seq (or (starrez.settings/starrez-blob-sas-url) "")))
-                :pg_host      (boolean (seq (or (starrez.settings/starrez-pg-host) "")))
-                :pg_user      (boolean (seq (or (starrez.settings/starrez-pg-user) "")))
-                :pg_password  (boolean (seq (or (starrez.settings/starrez-pg-password) "")))}
-   :settings   {:export_tables  (starrez.settings/starrez-export-tables)
-                :export_reports (starrez.settings/starrez-export-reports)
-                :sort_field     (starrez.settings/starrez-sort-field)
-                :keep_versions  (starrez.settings/starrez-keep-versions)
-                :pg_database    (starrez.settings/starrez-pg-database)
-                :metabase_database_id (starrez.settings/starrez-metabase-database-id)}})
+  (let [configured-report-ids (starrez.settings/csv-setting-values
+                               (starrez.settings/starrez-export-reports))]
+    {:configured     {:api_url      (boolean (seq (or (starrez.settings/starrez-api-url) "")))
+                      :api_username (boolean (seq (or (starrez.settings/starrez-api-username) "")))
+                      :api_token    (boolean (seq (or (starrez.settings/starrez-api-token) "")))
+                      :blob_sas_url (boolean (seq (or (starrez.settings/starrez-blob-sas-url) "")))
+                      :pg_host      (boolean (seq (or (starrez.settings/starrez-pg-host) "")))
+                      :pg_user      (boolean (seq (or (starrez.settings/starrez-pg-user) "")))
+                      :pg_password  (boolean (seq (or (starrez.settings/starrez-pg-password) "")))}
+     :settings       {:export_tables                 (starrez.settings/starrez-export-tables)
+                      :export_reports                (starrez.settings/starrez-export-reports)
+                      :auto_refresh_disabled_reports (starrez.settings/starrez-auto-refresh-disabled-reports)
+                      :sort_field                    (starrez.settings/starrez-sort-field)
+                      :keep_versions                 (starrez.settings/starrez-keep-versions)
+                      :pg_database                   (starrez.settings/starrez-pg-database)
+                      :metabase_database_id          (starrez.settings/starrez-metabase-database-id)}
+     :report_refresh (starrez.db/report-refresh-selection configured-report-ids)}))
 
 (api.macros/defendpoint :post "/test"
   "Test connectivity to the configured StarRez API."
@@ -42,11 +46,15 @@
   Rejects with {:error ...} if another export is already running."
   [_route-params
    _query-params
-   {:keys [export_tables export_reports]} :- [:maybe [:map
-                                                      [:export_tables {:optional true} [:maybe :string]]
-                                                      [:export_reports {:optional true} [:maybe :string]]]]]
+   {:keys [export_tables export_reports include_historical_reports activate_table_snapshot]}
+   :- [:maybe [:map
+               [:export_tables {:optional true} [:maybe :string]]
+               [:export_reports {:optional true} [:maybe :string]]
+               [:include_historical_reports {:optional true} [:maybe :boolean]]
+               [:activate_table_snapshot {:optional true} [:maybe :boolean]]]]]
   (perms/check-has-application-permission :setting)
-  (starrez.export/run-export (cond-> {:include-historical-reports? false}
+  (starrez.export/run-export (cond-> {:include-historical-reports? (boolean include_historical_reports)
+                                      :activate-table-snapshot?    (boolean activate_table_snapshot)}
                                (some? export_tables)  (assoc :export-tables export_tables)
                                (some? export_reports) (assoc :export-reports export_reports))))
 

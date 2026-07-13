@@ -2,7 +2,11 @@
   (:require
    [clojure.test :refer :all]
    [metabase.starrez.db :as starrez.db]
-   [metabase.starrez.export :as starrez.export]))
+   [metabase.starrez.export :as starrez.export]
+   [metabase.starrez.settings :as starrez.settings]))
+
+(defn- without-completed-at [result]
+  (dissoc result :completed_at))
 
 (deftest record-export-snapshots-keeps-reports-separate
   (let [recorded (atom [])]
@@ -32,9 +36,9 @@
 (deftest run-export-uses-configured-reports-by-default
   (let [requested-report-ids (atom [])
         merged              (atom nil)]
-    (with-redefs [metabase.starrez.settings/starrez-export-tables
+    (with-redefs [starrez.settings/starrez-export-tables
                   (constantly "")
-                  metabase.starrez.settings/starrez-export-reports
+                  starrez.settings/starrez-export-reports
                   (constantly "62751")
                   starrez.db/report-ids-for-export
                   (fn [_configured-report-ids]
@@ -60,7 +64,7 @@
                 :success   true}]
               :snapshots [42]
               :merge     {:destination_table "starrez_data.table_62751"}}
-             (starrez.export/run-export)))
+             (without-completed-at (starrez.export/run-export))))
       (is (= ["62751"] @requested-report-ids))
       (is (= ["62751"] (:report-ids @merged)))
       (is (every? :csv_body (:results @merged))))))
@@ -68,9 +72,9 @@
 (deftest run-export-uses-manual-report-overrides
   (let [requested-report-ids (atom [])
         merged              (atom nil)]
-    (with-redefs [metabase.starrez.settings/starrez-export-tables
+    (with-redefs [starrez.settings/starrez-export-tables
                   (constantly "")
-                  metabase.starrez.settings/starrez-export-reports
+                  starrez.settings/starrez-export-reports
                   (constantly "last-saved-report")
                   starrez.db/report-ids-for-export
                   (fn [_configured-report-ids]
@@ -96,14 +100,14 @@
                 :success   true}]
               :snapshots [42]
               :merge     {:destination_table "starrez_data.table_62751"}}
-             (starrez.export/run-export {:export-reports "62751"})))
+             (without-completed-at (starrez.export/run-export {:export-reports "62751"}))))
       (is (= ["62751"] @requested-report-ids))
       (is (= ["62751"] (:report-ids @merged))))))
 
 (deftest run-export-respects-blank-manual-report-overrides
-  (with-redefs [metabase.starrez.settings/starrez-export-tables
+  (with-redefs [starrez.settings/starrez-export-tables
                 (constantly "")
-                metabase.starrez.settings/starrez-export-reports
+                starrez.settings/starrez-export-reports
                 (constantly "last-saved-report")
                 starrez.export/export-report
                 (fn [report-id]
@@ -116,12 +120,12 @@
                 (fn [_report-ids _results]
                   (throw (ex-info "empty manual exports should not merge reports" {})))]
     (is (= {:results [] :snapshots [] :merge nil}
-           (starrez.export/run-export {:export-reports ""})))))
+           (without-completed-at (starrez.export/run-export {:export-reports ""}))))))
 
 (deftest run-export-respects-blank-manual-table-overrides
-  (with-redefs [metabase.starrez.settings/starrez-export-tables
+  (with-redefs [starrez.settings/starrez-export-tables
                 (constantly "Entry")
-                metabase.starrez.settings/starrez-export-reports
+                starrez.settings/starrez-export-reports
                 (constantly "")
                 starrez.export/export-table
                 (fn [table]
@@ -131,14 +135,62 @@
                 (fn [_blob-files]
                   (throw (ex-info "empty manual exports should not record snapshots" {})))]
     (is (= {:results [] :snapshots [] :merge nil}
-           (starrez.export/run-export {:export-tables ""})))))
+           (without-completed-at (starrez.export/run-export {:export-tables ""}))))))
+
+(deftest run-export-can-activate-table-snapshot
+  (let [recorded  (atom [])
+        activated (atom nil)]
+    (with-redefs [starrez.settings/starrez-export-tables
+                  (constantly "Entry")
+                  starrez.settings/starrez-export-reports
+                  (constantly "")
+                  starrez.export/export-table
+                  (fn [table]
+                    {:kind          :table
+                     :name          table
+                     :blob_name     (str "starrez_" table "_2026-05-28_12-07-33.csv")
+                     :records_count 2
+                     :success       true})
+                  starrez.db/record-export-week!
+                  (fn [blob-files]
+                    (swap! recorded conj blob-files)
+                    77)
+                  starrez.db/activate-week!
+                  (fn [week-id _downloader]
+                    (reset! activated week-id)
+                    {:results       [{:table "\"starrez_data\".\"Entry\""
+                                      :rows 2
+                                      :cols 3}]
+                     :metadata_sync {:database_id 2
+                                     :synced true}
+                     :error         nil})]
+      (is (= {:results
+              [{:kind          :table
+                :name          "Entry"
+                :blob_name     "starrez_Entry_2026-05-28_12-07-33.csv"
+                :records_count 2
+                :success       true}]
+              :snapshots         [77]
+              :merge             nil
+              :table_snapshot_id 77
+              :activation        {:results       [{:table "\"starrez_data\".\"Entry\""
+                                                   :rows 2
+                                                   :cols 3}]
+                                  :metadata_sync {:database_id 2
+                                                  :synced true}
+                                  :error         nil}}
+             (without-completed-at
+              (starrez.export/run-export {:activate-table-snapshot? true}))))
+      (is (= [{"Entry" "starrez_Entry_2026-05-28_12-07-33.csv"}]
+             @recorded))
+      (is (= 77 @activated)))))
 
 (deftest run-export-can-refresh-historical-reports-for-cron
   (let [requested-report-ids (atom [])
         merged              (atom nil)]
-    (with-redefs [metabase.starrez.settings/starrez-export-tables
+    (with-redefs [starrez.settings/starrez-export-tables
                   (constantly "")
-                  metabase.starrez.settings/starrez-export-reports
+                  starrez.settings/starrez-export-reports
                   (constantly "62751")
                   starrez.db/report-ids-for-export
                   (fn [configured-report-ids]
@@ -169,7 +221,8 @@
                 :success   true}]
               :snapshots [42 42]
               :merge     {:destination_table "starrez_data.table_59906"}}
-             (starrez.export/run-export {:include-historical-reports? true})))
+             (without-completed-at
+              (starrez.export/run-export {:include-historical-reports? true}))))
       (is (= ["59906" "62751"] @requested-report-ids))
       (is (= ["59906" "62751"] (:report-ids @merged)))
       (is (every? :csv_body (:results @merged))))))

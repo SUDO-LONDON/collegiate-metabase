@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useState } from "react";
 import { t } from "ttag";
 
 import {
@@ -5,8 +6,12 @@ import {
   SettingsSection,
 } from "metabase/admin/components/SettingsSection";
 import { AdminSettingInput } from "metabase/admin/settings/components/widgets/AdminSettingInput";
+import { useUpdateSettingMutation } from "metabase/api/settings";
 import {
+  type StarRezExportResult,
+  type StarRezMetadataSyncResult,
   type StarRezRunExportRequest,
+  type StarRezStatus,
   useActivateStarRezWeekMutation,
   useDeleteStarRezExportMutation,
   useGetStarRezStatusQuery,
@@ -21,6 +26,7 @@ import {
   Alert,
   Badge,
   Button,
+  Checkbox,
   Flex,
   Group,
   Loader,
@@ -29,6 +35,8 @@ import {
   Text,
   Title,
 } from "metabase/ui";
+
+const EMPTY_REPORT_IDS: string[] = [];
 
 function getSnapshotLabel(blobFiles: Record<string, string>) {
   const keys = Object.keys(blobFiles);
@@ -70,6 +78,160 @@ function getManualExportSettings(): StarRezRunExportRequest {
     ...(exportTables != null ? { export_tables: exportTables } : {}),
     ...(exportReports != null ? { export_reports: exportReports } : {}),
   };
+}
+
+function getFullRefreshSettings(): StarRezRunExportRequest {
+  return {
+    ...getManualExportSettings(),
+    include_historical_reports: true,
+    activate_table_snapshot: true,
+  };
+}
+
+function uniqueValues(values: string[]): string[] {
+  return Array.from(new Set(values));
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatCount(value: number | undefined): string {
+  return (value ?? 0).toLocaleString();
+}
+
+function getReportTotals(result: StarRezExportResult) {
+  const reports = result.merge?.reports ?? [];
+
+  return {
+    count: reports.length,
+    inserted: reports.reduce((sum, report) => sum + (report.inserted ?? 0), 0),
+    updated: reports.reduce((sum, report) => sum + (report.updated ?? 0), 0),
+    addedColumns: reports.reduce(
+      (sum, report) => sum + (report.added_columns?.length ?? 0),
+      0,
+    ),
+    failures: reports.filter((report) => report.error).length,
+  };
+}
+
+function getMetadataSync(
+  result: StarRezExportResult,
+): StarRezMetadataSyncResult | undefined {
+  return result.activation?.metadata_sync ?? result.merge?.metadata_sync;
+}
+
+function hasExportIssues(result: StarRezExportResult): boolean {
+  const metadataSync = getMetadataSync(result);
+
+  return Boolean(
+    result.error ||
+    result.activation?.error ||
+    metadataSync?.error ||
+    result.results?.some((exportItem) => !exportItem.success) ||
+    result.merge?.reports.some((report) => report.error),
+  );
+}
+
+function MetadataSyncStatus({ sync }: { sync?: StarRezMetadataSyncResult }) {
+  if (!sync) {
+    return null;
+  }
+
+  if (sync.synced) {
+    return (
+      <Text size="sm" c="success">
+        {sync.database_id
+          ? t`Metabase metadata synced for database ${sync.database_id}.`
+          : t`Metabase metadata synced.`}
+      </Text>
+    );
+  }
+
+  return (
+    <Text size="sm" c={sync.error ? "error" : "text-secondary"}>
+      {sync.error ?? t`Metabase metadata was not synced.`}
+    </Text>
+  );
+}
+
+function ExportResultSummary({ result }: { result: StarRezExportResult }) {
+  const activationResults = result.activation?.results ?? [];
+  const reportTotals = getReportTotals(result);
+  const hasIssues = hasExportIssues(result);
+
+  return (
+    <Paper
+      withBorder
+      p="md"
+      style={{
+        borderColor: hasIssues
+          ? "var(--mb-color-warning)"
+          : "var(--mb-color-success)",
+      }}
+    >
+      <Stack gap="xs">
+        <Group gap="sm">
+          <Badge color={hasIssues ? "warning" : "success"}>
+            {hasIssues ? t`Completed with issues` : t`Completed`}
+          </Badge>
+          {result.completed_at && (
+            <Text
+              fw={700}
+            >{t`Finished ${formatDateTime(result.completed_at)}`}</Text>
+          )}
+        </Group>
+
+        {activationResults.length > 0 && (
+          <Text size="sm" c="text-secondary">
+            {t`Live tables updated: ${activationResults
+              .map(
+                (table) => `${table.table} (${formatCount(table.rows)} rows)`,
+              )
+              .join(", ")}`}
+          </Text>
+        )}
+
+        {result.table_snapshot_id && !result.activation && (
+          <Text size="sm" c="text-secondary">
+            {t`Table snapshot ${result.table_snapshot_id} was recorded; live tables were not activated.`}
+          </Text>
+        )}
+
+        {result.activation?.error && (
+          <Text size="sm" c="error">
+            {t`Live table activation failed: ${result.activation.error}`}
+          </Text>
+        )}
+
+        {reportTotals.count > 0 && (
+          <Text size="sm" c="text-secondary">
+            {t`Reports refreshed: ${reportTotals.count}; inserted ${formatCount(
+              reportTotals.inserted,
+            )}; updated ${formatCount(reportTotals.updated)}; new columns ${formatCount(
+              reportTotals.addedColumns,
+            )}.`}
+          </Text>
+        )}
+
+        {reportTotals.failures > 0 && (
+          <Text size="sm" c="error">
+            {t`Report refresh failures: ${reportTotals.failures}`}
+          </Text>
+        )}
+
+        {result.snapshots && result.snapshots.length > 0 && (
+          <Text size="sm" c="text-secondary">
+            {t`Snapshots recorded: ${result.snapshots.join(", ")}`}
+          </Text>
+        )}
+
+        <MetadataSyncStatus sync={getMetadataSync(result)} />
+      </Stack>
+    </Paper>
+  );
 }
 
 function ConfigSection() {
@@ -143,7 +305,7 @@ function ConfigSection() {
           inputType="number"
         />
 
-        <Flex gap="md" align="center">
+        <Flex gap="md" align="center" wrap="wrap">
           <Button
             variant="outline"
             onClick={() => testConnection()}
@@ -170,6 +332,150 @@ function ConfigSection() {
   );
 }
 
+function ReportAutoRefreshSection({
+  status,
+  onStatusChanged,
+}: {
+  status?: StarRezStatus;
+  onStatusChanged: () => Promise<unknown> | unknown;
+}) {
+  const [updateSetting] = useUpdateSettingMutation();
+  const savedDisabledReportIds =
+    status?.report_refresh.disabled_report_ids ?? EMPTY_REPORT_IDS;
+  const reports = status?.report_refresh.reports ?? [];
+  const [disabledReportIds, setDisabledReportIds] = useState<string[]>(
+    savedDisabledReportIds,
+  );
+  const [savingReportId, setSavingReportId] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDisabledReportIds(savedDisabledReportIds);
+  }, [savedDisabledReportIds]);
+
+  const disabledReportIdSet = useMemo(
+    () => new Set(disabledReportIds),
+    [disabledReportIds],
+  );
+  const selectedReportCount = reports.filter(
+    (report) => !disabledReportIdSet.has(report.id),
+  ).length;
+
+  const saveDisabledReportIds = async (
+    nextDisabledReportIds: string[],
+    reportId: string,
+  ) => {
+    const normalizedReportIds = uniqueValues(nextDisabledReportIds);
+    setDisabledReportIds(normalizedReportIds);
+    setSavingReportId(reportId);
+
+    try {
+      await updateSetting({
+        key: "starrez-auto-refresh-disabled-reports",
+        value: normalizedReportIds,
+      }).unwrap();
+      await onStatusChanged();
+    } catch {
+      setDisabledReportIds(savedDisabledReportIds);
+    } finally {
+      setSavingReportId(null);
+    }
+  };
+
+  const handleReportToggle = async (reportId: string, checked: boolean) => {
+    const nextDisabledReportIds = checked
+      ? disabledReportIds.filter(
+          (disabledReportId) => disabledReportId !== reportId,
+        )
+      : [...disabledReportIds, reportId];
+
+    await saveDisabledReportIds(nextDisabledReportIds, reportId);
+  };
+
+  const handleSelectAll = async () => {
+    await saveDisabledReportIds([], "all");
+  };
+
+  return (
+    <SettingsSection title={t`Reports Automatically Refreshed`}>
+      <Stack gap="md">
+        <Group justify="space-between" align="center">
+          <Text c="text-secondary">
+            {reports.length > 0
+              ? t`${selectedReportCount} of ${reports.length} reports selected for automatic refresh.`
+              : t`Add report IDs above to make them available for automatic refresh.`}
+          </Text>
+          <Button
+            variant="subtle"
+            size="sm"
+            disabled={disabledReportIds.length === 0}
+            loading={savingReportId === "all"}
+            onClick={handleSelectAll}
+          >
+            {t`Select all`}
+          </Button>
+        </Group>
+
+        {reports.length === 0 ? (
+          <Text c="text-secondary">
+            {t`No reports have been configured or exported yet.`}
+          </Text>
+        ) : (
+          <Stack gap="sm">
+            {reports.map((report) => {
+              const selected = !disabledReportIdSet.has(report.id);
+
+              return (
+                <Paper key={report.id} withBorder p="md">
+                  <Flex
+                    justify="space-between"
+                    align="center"
+                    gap="md"
+                    wrap="wrap"
+                  >
+                    <Stack gap={4}>
+                      <Group gap="sm">
+                        <Title order={5}>{report.id}</Title>
+                        {report.configured && (
+                          <Badge variant="light">{t`Configured`}</Badge>
+                        )}
+                        {report.previously_exported && (
+                          <Badge variant="light">{t`Previously exported`}</Badge>
+                        )}
+                        <Badge
+                          color={selected ? "success" : undefined}
+                          variant={selected ? "filled" : "light"}
+                        >
+                          {selected ? t`Selected` : t`Skipped`}
+                        </Badge>
+                      </Group>
+                      <Text size="sm" c="text-secondary">
+                        {selected
+                          ? t`Included in scheduled refresh and Refresh all StarRez data.`
+                          : t`Excluded until selected again.`}
+                      </Text>
+                    </Stack>
+                    <Checkbox
+                      checked={selected}
+                      disabled={savingReportId != null}
+                      onChange={(event) =>
+                        handleReportToggle(
+                          report.id,
+                          event.currentTarget.checked,
+                        )
+                      }
+                      aria-label={t`Refresh report ${report.id} automatically`}
+                    />
+                  </Flex>
+                </Paper>
+              );
+            })}
+          </Stack>
+        )}
+      </Stack>
+    </SettingsSection>
+  );
+}
+
 function ExportSection() {
   const [runExport, { isLoading: exporting, data: exportResult }] =
     useRunStarRezExportMutation();
@@ -178,24 +484,35 @@ function ExportSection() {
     <SettingsSection title={t`Export StarRez Data`}>
       <Stack gap="md">
         <Text c="text-secondary">
-          {t`Pull configured tables and reports from StarRez, upload CSV snapshots, and update PostgreSQL report tables.`}
+          {t`Pull StarRez data, record CSV snapshots, update PostgreSQL report tables, and sync Metabase metadata.`}
         </Text>
 
-        <Flex gap="md" align="center">
+        <Flex gap="md" align="center" wrap="wrap">
           <Button
             variant="filled"
+            onClick={() => runExport(getFullRefreshSettings())}
+            loading={exporting}
+          >
+            {t`Refresh all StarRez data`}
+          </Button>
+          <Button
+            variant="outline"
             onClick={() => runExport(getManualExportSettings())}
             loading={exporting}
           >
-            {t`Run Export`}
+            {t`Export snapshots only`}
           </Button>
           {exporting && (
-            <Text c="text-secondary">{t`Fetching and uploading data…`}</Text>
+            <Text c="text-secondary">{t`Refreshing StarRez data…`}</Text>
           )}
         </Flex>
 
         {exportResult?.error && (
           <Alert color="error">{exportResult.error}</Alert>
+        )}
+
+        {exportResult && !exportResult.error && (
+          <ExportResultSummary result={exportResult} />
         )}
 
         {exportResult?.results && (
@@ -466,7 +783,7 @@ function SnapshotsSection() {
       <Stack gap="md">
         <Group justify="space-between" align="center">
           <Text c="text-secondary">
-            {t`Each export creates a snapshot. Click "Activate" to drop and reload starrez_data.* tables from that snapshot.`}
+            {t`Saved export snapshots. Activating a snapshot reloads its StarRez tables into PostgreSQL.`}
           </Text>
           <Button
             variant="subtle"
@@ -474,15 +791,22 @@ function SnapshotsSection() {
             loading={refreshing}
             onClick={() => refreshSnapshots()}
           >
-            {t`Refresh`}
+            {t`Sync metadata`}
           </Button>
         </Group>
 
         {refreshResult?.metadata_sync?.synced && (
           <Alert color="success">
-            {t`Snapshots and PostgreSQL schema refreshed.`}
+            {t`Snapshot list refreshed and Metabase metadata synced.`}
           </Alert>
         )}
+        {refreshResult?.metadata_sync &&
+          !refreshResult.metadata_sync.synced &&
+          !refreshResult.metadata_sync.error && (
+            <Alert color="warning">
+              {t`Snapshot list refreshed, but Metabase metadata was not synced.`}
+            </Alert>
+          )}
         {refreshResult?.error && (
           <Alert color="error">{refreshResult.error}</Alert>
         )}
@@ -498,6 +822,9 @@ function SnapshotsSection() {
               .map((r) => `${r.table} (${r.rows.toLocaleString()} rows)`)
               .join(", ")}`}
           </Alert>
+        )}
+        {activateResult?.metadata_sync && (
+          <MetadataSyncStatus sync={activateResult.metadata_sync} />
         )}
 
         {isLoading ? (
@@ -556,7 +883,7 @@ function SnapshotsSection() {
 }
 
 export function StarRezSettingsPage() {
-  const { data: status } = useGetStarRezStatusQuery();
+  const { data: status, refetch: refetchStatus } = useGetStarRezStatusQuery();
 
   const allConfigured =
     status?.configured.api_url &&
@@ -569,8 +896,8 @@ export function StarRezSettingsPage() {
 
   return (
     <SettingsPageWrapper
-      title={t`StarRez Export`}
-      description={t`Connect to your StarRez housing management system and export data to Azure Blob Storage for reporting and archiving.`}
+      title={t`StarRez Data Refresh`}
+      description={t`Connect StarRez, refresh data into PostgreSQL, and sync Metabase metadata for reporting.`}
     >
       {status && !allConfigured && (
         <Alert color="warning" mb="lg">
@@ -579,6 +906,10 @@ export function StarRezSettingsPage() {
       )}
 
       <ConfigSection />
+      <ReportAutoRefreshSection
+        status={status}
+        onStatusChanged={refetchStatus}
+      />
       <PostgresConfigSection />
       <ExportSection />
       <SnapshotsSection />

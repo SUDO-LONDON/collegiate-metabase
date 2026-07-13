@@ -191,18 +191,45 @@
            [#{} []]
            xs)))
 
-(defn report-ids-for-export
-  "Return report IDs in first-seen order, followed by newly configured IDs.
-  Successfully recorded historical reports keep getting refreshed even after
-  they are removed from the current setting."
-  [configured-report-ids]
+(defn known-report-ids
+  "Return previously successful StarRez report IDs in first-seen order."
+  []
   (distinct-in-order
-   (concat
-    (for [week       (reverse (list-weeks))
-          [report-id _blob-name :as entry] (:blob_files week)
-          :when      (report-snapshot-entry? entry)]
-      (name report-id))
-    configured-report-ids)))
+   (for [week       (reverse (list-weeks))
+         [report-id _blob-name :as entry] (:blob_files week)
+         :when      (report-snapshot-entry? entry)]
+     (name report-id))))
+
+(defn report-refresh-selection
+  "Return configured and previously exported reports with automatic refresh selection status.
+
+  Reports are selected by default. Only report IDs stored in
+  `starrez-auto-refresh-disabled-reports` are excluded from automatic refresh."
+  [configured-report-ids]
+  (let [configured-report-ids (distinct-in-order configured-report-ids)
+        historical-report-ids (known-report-ids)
+        configured-report-set (set configured-report-ids)
+        historical-report-set (set historical-report-ids)
+        disabled-report-ids   (starrez.settings/csv-setting-values
+                               (starrez.settings/starrez-auto-refresh-disabled-reports))
+        disabled-report-set   (set disabled-report-ids)
+        report-ids            (distinct-in-order (concat historical-report-ids configured-report-ids))
+        selected?             (complement disabled-report-set)]
+    {:reports             (mapv (fn [report-id]
+                                  {:id                  report-id
+                                   :selected            (selected? report-id)
+                                   :configured          (contains? configured-report-set report-id)
+                                   :previously_exported (contains? historical-report-set report-id)})
+                                report-ids)
+     :selected_report_ids (filterv selected? report-ids)
+     :disabled_report_ids disabled-report-ids}))
+
+(defn report-ids-for-export
+  "Return selected report IDs in first-seen order, followed by selected newly configured IDs.
+  Successfully recorded historical reports keep getting refreshed even after
+  they are removed from the current setting unless they are manually disabled."
+  [configured-report-ids]
+  (:selected_report_ids (report-refresh-selection configured-report-ids)))
 
 (defn- safe-ident-name
   "Produce a stable lower-snake identifier. Prefix leading digits because

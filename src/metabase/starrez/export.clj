@@ -2,7 +2,6 @@
   "Orchestrates StarRez data export: fetch (tables and reports) → CSV → upload to blob storage."
   (:require
    [clojure.data.csv :as csv]
-   [clojure.string :as str]
    [metabase.starrez.client :as starrez.client]
    [metabase.starrez.db :as starrez.db]
    [metabase.starrez.settings :as starrez.settings]
@@ -10,7 +9,7 @@
    [metabase.util.log :as log])
   (:import
    (java.io StringWriter)
-   (java.time LocalDateTime)
+   (java.time LocalDateTime OffsetDateTime)
    (java.time.format DateTimeFormatter)))
 
 (set! *warn-on-reflection* true)
@@ -20,6 +19,9 @@
 
 (defn- timestamp-str []
   (.format (LocalDateTime/now) timestamp-fmt))
+
+(defn- completed-at-str []
+  (str (OffsetDateTime/now)))
 
 (defn- records->csv
   "Convert a sequence of maps to a CSV string, sorted by `sort-field` if present in the records.
@@ -87,9 +89,7 @@
       (and (not success?) error) (assoc :error error))))
 
 (defn- split-csv-setting [s]
-  (->> (str/split (or s "") #",")
-       (map str/trim)
-       (remove str/blank?)))
+  (starrez.settings/csv-setting-values s))
 
 (defn- option-or-setting [option setting-fn]
   (if (some? option)
@@ -122,20 +122,34 @@
   [results]
   (successful-blob-files (filter #(= (:kind %) :table) results)))
 
-(defn- record-export-snapshots!
+(defn- record-export-snapshot-details!
   "Record table exports as one snapshot and each report export as its own snapshot.
-  Returns the ids of the created snapshot rows."
+  Returns the ids of the created snapshot rows and the table snapshot id, when present."
   [results]
   (let [table-files  (successful-table-blob-files results)
-        report-files (successful-report-blob-files results)]
-    (filterv some?
-             (into (cond-> []
-                     (seq table-files) (conj (starrez.db/record-export-week! table-files)))
-                   (map starrez.db/record-export-week!)
-                   report-files))))
+        report-files (successful-report-blob-files results)
+        table-id     (when (seq table-files)
+                       (starrez.db/record-export-week! table-files))
+        report-ids   (filterv some? (map starrez.db/record-export-week! report-files))]
+    {:ids               (filterv some? (into (cond-> []
+                                               table-id (conj table-id))
+                                             report-ids))
+     :table-snapshot-id table-id}))
+
+(defn- record-export-snapshots!
+  "Record export snapshots and return only the created snapshot ids."
+  [results]
+  (:ids (record-export-snapshot-details! results)))
 
 (defn- public-export-result [result]
   (dissoc result :csv_body))
+
+(defn- activate-table-snapshot!
+  [snapshot-id]
+  (let [sas-url    (starrez.settings/starrez-blob-sas-url)
+        downloader (fn [blob-name]
+                     (starrez.storage/download-export sas-url blob-name))]
+    (starrez.db/activate-week! snapshot-id downloader)))
 
 (defn run-export
   "Export all configured StarRez tables and reports to blob storage,
@@ -144,11 +158,13 @@
   manual exports. Blank overrides are respected.
   When `include-historical-reports?` is true, previously successful report IDs
   keep getting refreshed even if removed from the current setting.
+  When `activate-table-snapshot?` is true, the latest successful table snapshot
+  is activated after export so the live StarRez tables are updated immediately.
   Returns {:results [...] :snapshots [...] :merge ...}, or {:error ...} if another export is in progress.
   Only one export may run at a time."
   ([]
    (run-export {:include-historical-reports? false}))
-  ([{:keys [include-historical-reports? export-tables export-reports]}]
+  ([{:keys [include-historical-reports? activate-table-snapshot? export-tables export-reports]}]
    (if-not (compare-and-set! export-running? false true)
      {:error "An export is already in progress. Wait for it to finish."}
      (try
@@ -161,10 +177,22 @@
                                   configured-reports)
              results            (into (mapv export-table tables)
                                       (mapv export-report reports))
-             snapshot-ids       (record-export-snapshots! results)]
-         {:results   (mapv public-export-result results)
-          :snapshots snapshot-ids
-          :merge     (when (seq reports)
-                       (starrez.db/merge-report-exports! reports results))})
+             snapshot-details   (record-export-snapshot-details! results)
+             merge-result       (when (seq reports)
+                                  (starrez.db/merge-report-exports! reports results))
+             activation-result  (when activate-table-snapshot?
+                                  (if-let [table-snapshot-id (:table-snapshot-id snapshot-details)]
+                                    (activate-table-snapshot! table-snapshot-id)
+                                    (when (seq (successful-table-blob-files results))
+                                      {:error (str "Table exports succeeded, but no snapshot was recorded. "
+                                                   "Live StarRez tables were not activated.")})))]
+         (cond-> {:results      (mapv public-export-result results)
+                  :snapshots    (:ids snapshot-details)
+                  :merge        merge-result
+                  :completed_at (completed-at-str)}
+           (:table-snapshot-id snapshot-details)
+           (assoc :table_snapshot_id (:table-snapshot-id snapshot-details))
+           (some? activation-result)
+           (assoc :activation activation-result)))
        (finally
          (reset! export-running? false))))))

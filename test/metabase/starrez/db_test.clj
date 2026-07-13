@@ -3,6 +3,7 @@
    [clojure.string :as str]
    [clojure.test :refer :all]
    [metabase.starrez.db :as starrez.db]
+   [metabase.starrez.settings :as starrez.settings]
    [metabase.sync.sync-metadata :as sync-metadata]
    [next.jdbc :as jdbc]))
 
@@ -73,9 +74,40 @@
   (with-redefs [starrez.db/list-weeks
                 (constantly
                  [{:blob_files {(keyword "62751") "starrez_report_62751_2026-05-28_12-08-38.csv"}}
-                  {:blob_files {(keyword "59906") "starrez_report_59906_2026-05-28_12-07-38.csv"}}])]
+                  {:blob_files {(keyword "59906") "starrez_report_59906_2026-05-28_12-07-38.csv"}}])
+                starrez.settings/starrez-auto-refresh-disabled-reports
+                (constantly [])]
     (is (= ["59906" "62751" "70000"]
            (starrez.db/report-ids-for-export ["62751" "70000"])))))
+
+(deftest report-refresh-selection-selects-reports-unless-disabled
+  (with-redefs [starrez.db/list-weeks
+                (constantly
+                 [{:blob_files {(keyword "62751") "starrez_report_62751_2026-05-28_12-08-38.csv"}}
+                  {:blob_files {(keyword "59906") "starrez_report_59906_2026-05-28_12-07-38.csv"}}])
+                starrez.settings/starrez-auto-refresh-disabled-reports
+                (constantly ["62751"])]
+    (is (= {:reports             [{:id "59906"
+                                   :selected true
+                                   :configured false
+                                   :previously_exported true}
+                                  {:id "62751"
+                                   :selected false
+                                   :configured true
+                                   :previously_exported true}
+                                  {:id "70000"
+                                   :selected true
+                                   :configured true
+                                   :previously_exported false}]
+            :selected_report_ids ["59906" "70000"]
+            :disabled_report_ids ["62751"]}
+           (starrez.db/report-refresh-selection ["62751" "70000"]))))
+  (with-redefs [starrez.db/list-weeks
+                (constantly [])
+                starrez.settings/starrez-auto-refresh-disabled-reports
+                (constantly [])]
+    (is (= ["70000"]
+           (starrez.db/report-ids-for-export ["70000"])))))
 
 (deftest prepare-report-csv-validates-and-normalizes-booking-id
   (is (= {:columns ["booking_id" "room"]

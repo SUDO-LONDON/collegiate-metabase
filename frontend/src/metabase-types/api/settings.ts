@@ -827,6 +827,7 @@ export interface EnterpriseSettings extends Settings {
   "starrez-blob-sas-url"?: string | null;
   "starrez-export-tables"?: string | null;
   "starrez-export-reports"?: string | null;
+  "starrez-auto-refresh-disabled-reports"?: string[] | null;
   "starrez-sort-field"?: string | null;
   "starrez-keep-versions"?: number | null;
   "starrez-pg-host"?: string | null;
