@@ -287,14 +287,14 @@
       {:synced false
        :error  (ex-message e)})))
 
-(declare ensure-known-report-table-primary-keys!)
+(declare ensure-data-table-primary-keys!)
 
 (defn refresh-snapshots!
   "Return the latest StarRez snapshots and synchronously refresh the Metabase
   metadata for the configured StarRez Postgres database."
   []
   (when (configured?)
-    (ensure-known-report-table-primary-keys!))
+    (ensure-data-table-primary-keys!))
   (assoc (list-weeks-result)
          :metadata_sync (sync-metabase-schema!)))
 
@@ -350,6 +350,18 @@
      data-schema
      table-name]
     {:builder-fn rs/as-unqualified-lower-maps})))
+
+(defn- data-table-names [conn]
+  (mapv :table_name
+        (jdbc/execute!
+         conn
+         [(str "SELECT table_name "
+               "FROM information_schema.tables "
+               "WHERE table_schema = ? "
+               "AND table_type = 'BASE TABLE' "
+               "ORDER BY table_name")
+          data-schema]
+         {:builder-fn rs/as-unqualified-lower-maps})))
 
 (defn- table-columns [conn table-name]
   (mapv :column_name
@@ -630,23 +642,20 @@
 (defn- qualified-report-destination-table [report-id]
   (str data-schema "." (report-destination-table report-id)))
 
-(defn- ensure-known-report-table-primary-keys! []
+(defn- ensure-data-table-primary-keys! []
   (try
-    (let [destination-tables (distinct-in-order (map report-destination-table (report-ids-for-export [])))]
-      (when (seq destination-tables)
-        (with-open [conn (get-connection)]
-          (doseq [destination-table destination-tables]
-            (try
-              (when (table-exists? conn destination-table)
-                (when-let [row-id-column (ensure-technical-primary-key! conn destination-table)]
-                  (log/infof "Added technical primary key %s to StarRez report table %s"
-                             row-id-column
-                             destination-table)))
-              (catch Exception e
-                (log/warnf e "Failed to ensure technical primary key for StarRez report table %s"
-                           destination-table)))))))
+    (with-open [conn (get-connection)]
+      (doseq [table-name (data-table-names conn)]
+        (try
+          (when-let [row-id-column (ensure-technical-primary-key! conn table-name)]
+            (log/infof "Added technical primary key %s to StarRez data table %s"
+                       row-id-column
+                       table-name))
+          (catch Exception e
+            (log/warnf e "Failed to ensure technical primary key for StarRez data table %s"
+                       table-name)))))
     (catch Exception e
-      (log/warn e "Failed to ensure StarRez report table primary keys before metadata sync"))))
+      (log/warn e "Failed to ensure StarRez data table primary keys before metadata sync"))))
 
 (defn- report-merge-error [report-id error]
   {:report_id         report-id
@@ -709,7 +718,7 @@
         rows    (rest csv-rows)
         _       (when-not (seq headers)
                   (throw (ex-info "CSV has no header row" {:table table-name})))
-        cols    (unique-column-names headers)
+        cols    (unique-column-names headers #{technical-row-id-column})
         _       (when (> (count cols) postgres-max-columns)
                   (throw (ex-info (format "CSV for %s has %d columns after parsing, which exceeds Postgres limit %d. The file may not be newline-delimited correctly."
                                           table-name
@@ -718,8 +727,9 @@
                                   {:table table-name
                                    :columns (count cols)
                                    :max-columns postgres-max-columns})))
-        tbl     (qualified-table-name data-schema (safe-table-name table-name))
-        col-ddl (str/join ", " (map #(str (quote-ident %) " TEXT") cols))]
+        tbl        (qualified-table-name data-schema (safe-table-name table-name))
+        row-id-ddl (str (quote-ident technical-row-id-column) " BIGSERIAL PRIMARY KEY")
+        col-ddl    (str/join ", " (cons row-id-ddl (map #(str (quote-ident %) " TEXT") cols)))]
     (log/infof "Dropping StarRez table if it exists: %s" tbl)
     (jdbc/execute! conn [(str "DROP TABLE IF EXISTS " tbl)])
     (log/infof "Creating StarRez table: %s (%d columns)" tbl (count cols))

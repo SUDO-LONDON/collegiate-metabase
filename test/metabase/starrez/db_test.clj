@@ -218,6 +218,31 @@
       (is (= ["CREATE TABLE \"starrez_data\".\"table_59906\" (\"_metabase_row_id\" BIGSERIAL PRIMARY KEY, \"booking_id\" TEXT, \"room\" TEXT)"]
              @queries)))))
 
+(deftest create-snapshot-table-adds-technical-primary-key
+  (let [queries (atom [])
+        copies  (atom [])]
+    (with-redefs [jdbc/execute!
+                  (fn [_conn [sql]]
+                    (swap! queries conj sql))
+                  starrez.db/copy-rows!
+                  (fn [_conn table-name columns rows]
+                    (swap! copies conj [table-name columns rows]))]
+      (is (= {:table "\"starrez_data\".\"entry\""
+              :rows  1
+              :cols  2}
+             (#'starrez.db/create-and-load-table!
+              nil
+              "Entry"
+              [["_metabase_row_id" "Room"]
+               ["source-id" "A"]])))
+      (is (= ["DROP TABLE IF EXISTS \"starrez_data\".\"entry\""
+              (str "CREATE TABLE \"starrez_data\".\"entry\" "
+                   "(\"_metabase_row_id\" BIGSERIAL PRIMARY KEY, "
+                   "\"metabase_row_id\" TEXT, \"room\" TEXT)")]
+             @queries))
+      (is (= [["\"starrez_data\".\"entry\"" ["metabase_row_id" "room"] (list ["source-id" "A"])]]
+             @copies)))))
+
 (deftest ensure-technical-primary-key-adds-row-id-to-existing-report-table
   (let [queries (atom [])]
     (with-redefs [jdbc/execute-one!
@@ -240,6 +265,19 @@
               "ALTER TABLE \"starrez_data\".\"table_59906\" ADD PRIMARY KEY (\"_metabase_row_id\")"
               "ALTER SEQUENCE \"starrez_data\".\"table_59906_metabase_row_id_seq\" OWNED BY \"starrez_data\".\"table_59906\".\"_metabase_row_id\""]
              @queries)))))
+
+(deftest ensure-data-table-primary-keys-repairs-every-existing-data-table
+  (let [repaired (atom [])]
+    (with-redefs [starrez.db/get-connection
+                  (constantly nil)
+                  starrez.db/data-table-names
+                  (constantly ["active_report" "entry"])
+                  starrez.db/ensure-technical-primary-key!
+                  (fn [_conn table-name]
+                    (swap! repaired conj table-name)
+                    "_metabase_row_id")]
+      (#'starrez.db/ensure-data-table-primary-keys!)
+      (is (= ["active_report" "entry"] @repaired)))))
 
 (deftest truncate-report-table-keeps-dependent-views-intact
   (let [queries (atom [])]
@@ -357,7 +395,7 @@
   (let [repaired? (atom false)]
     (with-redefs [starrez.db/configured?
                   (constantly true)
-                  starrez.db/ensure-known-report-table-primary-keys!
+                  starrez.db/ensure-data-table-primary-keys!
                   (fn []
                     (reset! repaired? true))
                   starrez.db/list-weeks-result
