@@ -10,32 +10,40 @@
 
 (set! *warn-on-reflection* true)
 
-(def ^:private weekly-export-job-key
+;; Keep the original Quartz identities so existing deployed weekly triggers are rescheduled, not duplicated.
+(def ^:private scheduled-export-job-key
   (jobs/key "metabase.task.starrez.weekly-export.job"))
 
-(def ^:private weekly-export-trigger-key
+(def ^:private scheduled-export-trigger-key
   (triggers/key "metabase.task.starrez.weekly-export.trigger"))
 
-(task/defjob ^{:doc "Weekly StarRez export and cumulative report merge."
+(def ^:private daily-export-cron
+  "0 0 1 * * ? *")
+
+(task/defjob ^{:doc "Daily StarRez export and cumulative report merge."
                org.quartz.DisallowConcurrentExecution true}
   StarRezWeeklyExport
   [_]
-  (log/info "Starting scheduled StarRez weekly export")
+  (log/info "Starting scheduled StarRez daily export")
   (let [result        (starrez.export/run-export {:include-historical-reports? true})
         export-errors (seq (filter (comp not :success) (:results result)))
         merge-errors  (seq (filter :error (get-in result [:merge :reports])))]
     (if (or (:error result) export-errors merge-errors)
-      (log/errorf "Scheduled StarRez weekly export completed with errors: %s" (pr-str result))
-      (log/infof "Scheduled StarRez weekly export finished: %s" (pr-str result)))))
+      (log/errorf "Scheduled StarRez daily export completed with errors: %s" (pr-str result))
+      (log/infof "Scheduled StarRez daily export finished: %s" (pr-str result)))))
+
+(defn- scheduled-export-job []
+  (jobs/build
+   (jobs/of-type StarRezWeeklyExport)
+   (jobs/with-identity scheduled-export-job-key)))
+
+(defn- scheduled-export-trigger []
+  (triggers/build
+   (triggers/with-identity scheduled-export-trigger-key)
+   (triggers/with-schedule
+    (cron/schedule
+     (cron/cron-schedule daily-export-cron)
+     (cron/with-misfire-handling-instruction-do-nothing)))))
 
 (defmethod task/init! ::StarRezWeeklyExport [_]
-  (let [job     (jobs/build
-                 (jobs/of-type StarRezWeeklyExport)
-                 (jobs/with-identity weekly-export-job-key))
-        trigger (triggers/build
-                 (triggers/with-identity weekly-export-trigger-key)
-                 (triggers/with-schedule
-                  (cron/schedule
-                   (cron/cron-schedule "0 0 1 ? * MON *")
-                   (cron/with-misfire-handling-instruction-do-nothing))))]
-    (task/schedule-task! job trigger)))
+  (task/schedule-task! (scheduled-export-job) (scheduled-export-trigger)))
