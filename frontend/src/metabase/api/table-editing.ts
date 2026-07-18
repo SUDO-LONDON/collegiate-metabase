@@ -2,12 +2,15 @@ import type { TableId } from "metabase-types/api";
 
 import type {
   EditableTableAction,
+  EditableTableColumnInput,
+  EditableTableColumnResponse,
   EditableTableFormResponse,
   EditableTableMutationResponse,
   EditableTableRow,
 } from "../table-editing/types";
 
 import { Api } from "./api";
+import { idTag, invalidateTags, listTag, tag } from "./tags";
 
 export const tableEditingApi = Api.injectEndpoints({
   endpoints: (builder) => ({
@@ -64,10 +67,33 @@ export const tableEditingApi = Api.injectEndpoints({
         body,
       }),
     }),
+    addTableColumn: builder.mutation<
+      EditableTableColumnResponse,
+      {
+        tableId: TableId;
+        column: EditableTableColumnInput;
+      }
+    >({
+      query: ({ tableId, ...body }) => ({
+        method: "POST",
+        url: `/api/table-editing/${tableId}/columns`,
+        body,
+      }),
+      invalidatesTags: (_, error, { tableId }) =>
+        invalidateTags(error, [
+          idTag("table", tableId),
+          listTag("field"),
+          listTag("field-values"),
+          tag("card"),
+          tag("dataset"),
+          listTag("erd"),
+        ]),
+    }),
   }),
 });
 
 export const {
+  useAddTableColumnMutation,
   useCreateTableRowMutation,
   useDeleteTableRowMutation,
   useDescribeTableEditFormMutation,

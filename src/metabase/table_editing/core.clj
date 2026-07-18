@@ -4,9 +4,14 @@
    [clojure.string :as str]
    [metabase.actions.core :as actions]
    [metabase.api.common :as api]
+   [metabase.driver :as driver]
+   [metabase.driver.util :as driver.u]
    [metabase.settings.core :as setting]
+   [metabase.sync.sync-metadata :as sync-metadata]
    [metabase.table-editing.settings :as table-editing.settings]
+   [metabase.util :as u]
    [metabase.util.i18n :refer [tru]]
+   [metabase.util.log :as log]
    [metabase.util.malli :as mu]
    [toucan2.core :as t2]))
 
@@ -89,10 +94,145 @@
 (defn- pk-fields [fields]
   (filter #(= :type/PK (:semantic_type %)) fields))
 
+(def ^:private editable-column-types
+  #{:text :integer :decimal :boolean :date :datetime})
+
+(defn- column-type-sql
+  [driver column-type]
+  (case column-type
+    :text     "TEXT"
+    :integer  "BIGINT"
+    :decimal  (if (= driver :mysql) "DECIMAL(38, 10)" "NUMERIC")
+    :boolean  "BOOLEAN"
+    :date     "DATE"
+    :datetime (if (= driver :mysql) "DATETIME" "TIMESTAMP")))
+
+(defn- normalize-column-name
+  [column-name]
+  (str/trim (str column-name)))
+
+(defn- validate-column-name!
+  [column-name]
+  (cond
+    (str/blank? column-name)
+    (throw (ex-info (tru "Column name is required.")
+                    {:status-code 400}))
+
+    (> (count column-name) 128)
+    (throw (ex-info (tru "Column name must be 128 characters or fewer.")
+                    {:status-code 400}))
+
+    (str/includes? column-name ".")
+    (throw (ex-info (tru "Column name cannot contain a period.")
+                    {:status-code 400}))
+
+    (re-find #"\p{Cntrl}" column-name)
+    (throw (ex-info (tru "Column name cannot contain control characters.")
+                    {:status-code 400})))
+  column-name)
+
+(defn- validate-column-type!
+  [column-type]
+  (when-not (contains? editable-column-types column-type)
+    (throw (ex-info (tru "Unsupported column type.")
+                    {:status-code 400
+                     :type        column-type})))
+  column-type)
+
+(defn- check-column-does-not-exist!
+  [fields column-name]
+  (let [existing-field-names (into #{}
+                                   (map (comp u/lower-case-en :name))
+                                   fields)]
+    (when (contains? existing-field-names (u/lower-case-en column-name))
+      (throw (ex-info (tru "A column with this name already exists.")
+                      {:status-code 400
+                       :column      column-name})))))
+
+(defn- supported-ddl-driver?
+  [driver]
+  (contains? #{:postgres :mysql} driver))
+
+(defn- quote-ident
+  [driver identifier]
+  (case driver
+    :mysql    (str "`" (str/replace identifier "`" "``") "`")
+    :postgres (str "\"" (str/replace identifier "\"" "\"\"") "\"")))
+
+(defn- qualified-table-name
+  [driver table]
+  (if (seq (:schema table))
+    (str (quote-ident driver (:schema table))
+         "."
+         (quote-ident driver (:name table)))
+    (quote-ident driver (:name table))))
+
+(defn- add-column-sql
+  [driver table {:keys [name type nullable]}]
+  (format "ALTER TABLE %s ADD COLUMN %s %s%s"
+          (qualified-table-name driver table)
+          (quote-ident driver name)
+          (column-type-sql driver type)
+          (if nullable "" " NOT NULL")))
+
+(defn- execute-ddl!
+  [database sql]
+  (let [database-driver (driver.u/database->driver database)]
+    (when-not (supported-ddl-driver? database-driver)
+      (throw (ex-info (tru "Adding columns is only supported for PostgreSQL and MySQL tables.")
+                      {:status-code 400
+                       :driver      database-driver})))
+    (driver/execute-raw-queries! database-driver (:id database) [[sql nil]])))
+
+(defn- sync-table-metadata-result
+  [table]
+  (try
+    (sync-metadata/sync-table-metadata! table)
+    {:synced true}
+    (catch Throwable e
+      (log/warn e "Unable to sync table metadata after adding a column")
+      {:synced false
+       :error  (or (ex-message e) (str e))})))
+
 (mu/defn has-primary-key? :- :boolean
   "Return whether `table-id` has at least one active primary-key field."
   [table-id :- pos-int?]
   (boolean (seq (pk-fields (table-fields table-id)))))
+
+(mu/defn add-column! :- [:map
+                         [:success [:= true]]
+                         [:column [:map
+                                   [:name :string]
+                                   [:type :string]
+                                   [:nullable :boolean]]]
+                         [:metadata_sync [:map
+                                          [:synced :boolean]
+                                          [:error {:optional true} :string]]]]
+  "Add a column to an editable table and sync Metabase metadata for that table."
+  [table-id :- pos-int?
+   column   :- [:map
+                [:name :string]
+                [:type :keyword]
+                [:nullable {:optional true} [:maybe :boolean]]]]
+  (let [{:keys [database table]} (editable-table-context! table-id)
+        database-driver          (driver.u/database->driver database)
+        column-name              (validate-column-name! (normalize-column-name (:name column)))
+        column-type              (validate-column-type! (:type column))
+        nullable?                (not (false? (:nullable column)))
+        sanitized-column         {:name     column-name
+                                  :type     column-type
+                                  :nullable nullable?}]
+    (when-not (supported-ddl-driver? database-driver)
+      (throw (ex-info (tru "Adding columns is only supported for PostgreSQL and MySQL tables.")
+                      {:status-code 400
+                       :driver      database-driver})))
+    (check-column-does-not-exist! (table-fields table-id) column-name)
+    (execute-ddl! database (add-column-sql database-driver table sanitized-column))
+    {:success       true
+     :column        {:name     column-name
+                     :type     (name column-type)
+                     :nullable nullable?}
+     :metadata_sync (sync-table-metadata-result table)}))
 
 (defn- input-type
   [action field]

@@ -24,6 +24,10 @@ export interface StarRezStatus {
     selected_report_ids: string[];
     disabled_report_ids: string[];
   };
+  scheduled_refresh?: {
+    cron: string;
+    last_run: StarRezScheduledRefreshStatus | null;
+  };
 }
 
 export interface StarRezAutoRefreshReport {
@@ -31,6 +35,29 @@ export interface StarRezAutoRefreshReport {
   selected: boolean;
   configured: boolean;
   previously_exported: boolean;
+}
+
+export type StarRezScheduledRefreshState =
+  | "running"
+  | "completed"
+  | "completed_with_issues"
+  | "failed";
+
+export interface StarRezScheduledRefreshStatus {
+  status: StarRezScheduledRefreshState;
+  schedule?: string;
+  started_at?: string;
+  completed_at?: string;
+  exports_total?: number;
+  exports_failed?: number;
+  reports_total?: number;
+  reports_failed?: number;
+  reports_inserted?: number;
+  reports_updated?: number;
+  added_columns?: number;
+  snapshots_total?: number;
+  errors?: string[];
+  metadata_sync?: StarRezMetadataSyncResult;
 }
 
 export interface StarRezWeek {

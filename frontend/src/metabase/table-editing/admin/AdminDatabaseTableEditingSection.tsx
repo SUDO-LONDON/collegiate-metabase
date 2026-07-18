@@ -255,7 +255,7 @@ export function AdminDatabaseTableEditingSection({
 
         <Box
           p="md"
-          bg="bg-white"
+          bg="background-primary"
           bd="1px solid var(--mb-color-border)"
           style={{ borderRadius: 8, maxHeight: 320, overflowY: "auto" }}
         >

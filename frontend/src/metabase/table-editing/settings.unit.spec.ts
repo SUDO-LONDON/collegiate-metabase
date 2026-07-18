@@ -1,3 +1,4 @@
+import type { DatabaseSettings } from "metabase-types/api";
 import { createMockDatabase } from "metabase-types/api/mocks";
 
 import {
@@ -11,7 +12,7 @@ describe("table-editing settings helpers", () => {
     const database = createMockDatabase({
       settings: {
         "database-editable-table-ids": [1, "2", " 3 ", "oops", -1, 2],
-      },
+      } as DatabaseSettings,
     });
 
     expect(getEditableTableIds(database)).toEqual([1, 2, 3]);

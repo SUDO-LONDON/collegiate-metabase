@@ -16,6 +16,15 @@
 (mr/def ::row
   [:map-of :string :any])
 
+(mr/def ::column-type
+  [:enum "text" "integer" "decimal" "boolean" "date" "datetime"])
+
+(mr/def ::column
+  [:map
+   [:name ms/NonBlankString]
+   [:type ::column-type]
+   [:nullable {:optional true} [:maybe :boolean]]])
+
 (mr/def ::describe-form-response
   [:map
    [:title :string]
@@ -44,6 +53,20 @@
   [:map
    [:success [:= true]]
    [:outputs {:optional true} [:sequential :map]]])
+
+(mr/def ::metadata-sync-response
+  [:map
+   [:synced :boolean]
+   [:error {:optional true} :string]])
+
+(mr/def ::add-column-response
+  [:map
+   [:success [:= true]]
+   [:column [:map
+             [:name :string]
+             [:type ::column-type]
+             [:nullable :boolean]]]
+   [:metadata_sync ::metadata-sync-response]])
 
 (defn- parse-action [action]
   (keyword action))
@@ -92,5 +115,16 @@
   (perms/check-has-application-permission :setting)
   (api/check-superuser)
   (table-editing/execute-row-action! table-id :delete row))
+
+(api.macros/defendpoint :post "/:table-id/columns" :- ::add-column-response
+  "Add a column to an allowlisted table."
+  [{:keys [table-id]} :- [:map
+                          [:table-id ms/PositiveInt]]
+   _query-params
+   {:keys [column]} :- [:map
+                        [:column ::column]]]
+  (perms/check-has-application-permission :setting)
+  (api/check-superuser)
+  (table-editing/add-column! table-id (update column :type keyword)))
 
 (def ^:private keep-me ::keep-me)

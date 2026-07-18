@@ -181,7 +181,9 @@ function ParameterInput({
     return (
       <NumberInput
         {...commonProps}
-        value={typeof value === "number" ? value : value == null ? "" : value}
+        value={
+          typeof value === "number" || typeof value === "string" ? value : ""
+        }
         onChange={(nextValue) =>
           onChange(nextValue === "" ? null : (nextValue as number | string))
         }

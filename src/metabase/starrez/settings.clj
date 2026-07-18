@@ -109,6 +109,14 @@
   :type       :integer
   :audit      :getter)
 
+(defsetting starrez-scheduled-refresh-status
+  (deferred-tru "Status of the last scheduled StarRez refresh")
+  :encryption :no
+  :visibility :admin
+  :type       :json
+  :export?    false
+  :audit      :no-value)
+
 (defn csv-setting-values
   "Return a normalized vector of values from a StarRez comma-separated or CSV setting."
   [setting-value]

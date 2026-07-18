@@ -8,6 +8,7 @@
    [metabase.starrez.export :as starrez.export]
    [metabase.starrez.settings :as starrez.settings]
    [metabase.starrez.storage :as starrez.storage]
+   [metabase.starrez.task.export :as starrez.task.export]
    [metabase.util.malli.schema :as ms]))
 
 (set! *warn-on-reflection* true)
@@ -32,7 +33,9 @@
                       :keep_versions                 (starrez.settings/starrez-keep-versions)
                       :pg_database                   (starrez.settings/starrez-pg-database)
                       :metabase_database_id          (starrez.settings/starrez-metabase-database-id)}
-     :report_refresh (starrez.db/report-refresh-selection configured-report-ids)}))
+     :report_refresh (starrez.db/report-refresh-selection configured-report-ids)
+     :scheduled_refresh {:cron     starrez.task.export/scheduled-export-cron
+                         :last_run (starrez.settings/starrez-scheduled-refresh-status)}}))
 
 (api.macros/defendpoint :post "/test"
   "Test connectivity to the configured StarRez API."

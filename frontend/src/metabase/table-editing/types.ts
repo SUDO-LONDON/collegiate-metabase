@@ -4,6 +4,29 @@ export type EditableTableAction = "create" | "update" | "delete";
 
 export type EditableTableRow = Record<string, RowValue>;
 
+export type EditableTableColumnType =
+  | "text"
+  | "integer"
+  | "decimal"
+  | "boolean"
+  | "date"
+  | "datetime";
+
+export type EditableTableColumnInput = {
+  name: string;
+  type: EditableTableColumnType;
+  nullable: boolean;
+};
+
+export type EditableTableColumnResponse = {
+  success: true;
+  column: EditableTableColumnInput;
+  metadata_sync: {
+    synced: boolean;
+    error?: string;
+  };
+};
+
 export type EditableTableFormParameterInputType =
   | "text"
   | "textarea"

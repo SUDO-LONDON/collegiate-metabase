@@ -11,6 +11,7 @@ import {
   type StarRezExportResult,
   type StarRezMetadataSyncResult,
   type StarRezRunExportRequest,
+  type StarRezScheduledRefreshStatus,
   type StarRezStatus,
   useActivateStarRezWeekMutation,
   useDeleteStarRezExportMutation,
@@ -135,6 +136,28 @@ function hasExportIssues(result: StarRezExportResult): boolean {
   );
 }
 
+type ScheduledRefreshBadge = {
+  color?: "info" | "success" | "warning" | "error";
+  label: string;
+};
+
+function getScheduledRefreshBadge(
+  lastRun?: StarRezScheduledRefreshStatus | null,
+): ScheduledRefreshBadge {
+  switch (lastRun?.status) {
+    case "running":
+      return { color: "info", label: t`Running` };
+    case "completed":
+      return { color: "success", label: t`Completed` };
+    case "completed_with_issues":
+      return { color: "warning", label: t`Completed with issues` };
+    case "failed":
+      return { color: "error", label: t`Failed` };
+    default:
+      return { color: undefined, label: t`No run recorded` };
+  }
+}
+
 function MetadataSyncStatus({ sync }: { sync?: StarRezMetadataSyncResult }) {
   if (!sync) {
     return null;
@@ -154,6 +177,86 @@ function MetadataSyncStatus({ sync }: { sync?: StarRezMetadataSyncResult }) {
     <Text size="sm" c={sync.error ? "error" : "text-secondary"}>
       {sync.error ?? t`Metabase metadata was not synced.`}
     </Text>
+  );
+}
+
+function ScheduledRefreshStatusSection({
+  status,
+  onRefresh,
+}: {
+  status?: StarRezStatus;
+  onRefresh: () => Promise<unknown> | unknown;
+}) {
+  const lastRun = status?.scheduled_refresh?.last_run;
+  const badge = getScheduledRefreshBadge(lastRun);
+  const errors = lastRun?.errors ?? [];
+
+  return (
+    <SettingsSection title={t`Scheduled Refresh`}>
+      <Stack gap="md">
+        <Group justify="space-between" align="flex-start" gap="md" wrap="wrap">
+          <Stack gap={4}>
+            <Group gap="sm">
+              <Badge variant="light">{t`Daily at 1:00 AM`}</Badge>
+              <Badge color={badge.color}>{badge.label}</Badge>
+            </Group>
+
+            {lastRun?.status === "running" && lastRun.started_at ? (
+              <Text c="text-secondary">
+                {t`Started ${formatDateTime(lastRun.started_at)}.`}
+              </Text>
+            ) : lastRun?.completed_at ? (
+              <Text c="text-secondary">
+                {t`Last completed ${formatDateTime(lastRun.completed_at)}.`}
+              </Text>
+            ) : (
+              <Text c="text-secondary">
+                {t`No scheduled refresh has been recorded yet.`}
+              </Text>
+            )}
+          </Stack>
+
+          <Button variant="subtle" size="sm" onClick={() => onRefresh()}>
+            {t`Refresh status`}
+          </Button>
+        </Group>
+
+        {lastRun ? (
+          <Paper withBorder p="md">
+            <Stack gap="xs">
+              <Text size="sm" c="text-secondary">
+                {t`Exports: ${formatCount(lastRun.exports_total)} total, ${formatCount(
+                  lastRun.exports_failed,
+                )} failed.`}
+              </Text>
+              <Text size="sm" c="text-secondary">
+                {t`Reports: ${formatCount(lastRun.reports_total)} refreshed, ${formatCount(
+                  lastRun.reports_inserted,
+                )} inserted, ${formatCount(lastRun.reports_updated)} updated, ${formatCount(
+                  lastRun.added_columns,
+                )} new columns.`}
+              </Text>
+              <Text size="sm" c="text-secondary">
+                {t`Snapshots recorded: ${formatCount(lastRun.snapshots_total)}.`}
+              </Text>
+              <MetadataSyncStatus sync={lastRun.metadata_sync} />
+            </Stack>
+          </Paper>
+        ) : null}
+
+        {errors.length > 0 ? (
+          <Alert color="error" variant="light">
+            <Stack gap={4}>
+              {errors.map((error, index) => (
+                <Text key={`${index}-${error}`} size="sm">
+                  {error}
+                </Text>
+              ))}
+            </Stack>
+          </Alert>
+        ) : null}
+      </Stack>
+    </SettingsSection>
   );
 }
 
@@ -909,6 +1012,10 @@ export function StarRezSettingsPage() {
       <ReportAutoRefreshSection
         status={status}
         onStatusChanged={refetchStatus}
+      />
+      <ScheduledRefreshStatusSection
+        status={status}
+        onRefresh={refetchStatus}
       />
       <PostgresConfigSection />
       <ExportSection />

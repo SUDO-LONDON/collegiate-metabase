@@ -1,5 +1,5 @@
-import type { CSSProperties } from "react";
-import { useMemo, useState } from "react";
+import type { CSSProperties, FormEvent } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { t } from "ttag";
 
 import { skipToken } from "metabase/api/api";
@@ -10,6 +10,7 @@ import {
   useGetTableQueryMetadataQuery,
 } from "metabase/api/table";
 import {
+  useAddTableColumnMutation,
   useCreateTableRowMutation,
   useDeleteTableRowMutation,
   useUpdateTableRowMutation,
@@ -29,13 +30,17 @@ import {
   Box,
   Button,
   Card,
+  Checkbox,
   Flex,
   Group,
   Icon,
   Modal,
   Paper,
+  Select,
   Stack,
   Text,
+  TextInput,
+  Tooltip,
 } from "metabase/ui";
 import * as Urls from "metabase/urls";
 import type { Database, Table } from "metabase-types/api";
@@ -47,7 +52,11 @@ import type {
 
 import { TableEditingFormModal } from "./TableEditingFormModal";
 import { isDatabaseTableEditingEnabled, isTableEditable } from "./settings";
-import type { EditableTableRow } from "./types";
+import type {
+  EditableTableColumnInput,
+  EditableTableColumnType,
+  EditableTableRow,
+} from "./types";
 
 type TableEditPageProps = {
   params: {
@@ -67,9 +76,11 @@ export function TableEditPage({ params }: TableEditPageProps) {
   const [sendToast] = useToast();
 
   const [createModalOpen, setCreateModalOpen] = useState(false);
+  const [columnModalOpen, setColumnModalOpen] = useState(false);
   const [editingRow, setEditingRow] = useState<EditableTableRow | null>(null);
   const [deletingRow, setDeletingRow] = useState<EditableTableRow | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [addColumnError, setAddColumnError] = useState<string | null>(null);
 
   const databaseResult = useGetDatabaseQuery(
     hasValidDatabaseId ? { id: databaseId } : skipToken,
@@ -85,6 +96,7 @@ export function TableEditPage({ params }: TableEditPageProps) {
     { skip: !hasValidTableId },
   );
 
+  const [addTableColumn, addTableColumnResult] = useAddTableColumnMutation();
   const [createTableRow, createTableRowResult] = useCreateTableRowMutation();
   const [updateTableRow, updateTableRowResult] = useUpdateTableRowMutation();
   const [deleteTableRow, deleteTableRowResult] = useDeleteTableRowMutation();
@@ -122,16 +134,41 @@ export function TableEditPage({ params }: TableEditPageProps) {
 
   const database = databaseResult.data;
   const table = tableResult.data;
-  const canManageRows =
+  const canManageTable =
     database != null &&
     table != null &&
     isDatabaseTableEditingEnabled(database) &&
     isTableEditable(database, table.id) &&
-    Boolean(table.is_writable) &&
-    primaryKeyColumns.length > 0;
+    Boolean(table.is_writable);
+  const canManageRows = canManageTable && primaryKeyColumns.length > 0;
 
   const handleRefresh = async () => {
-    await tableDataResult.refetch();
+    await Promise.all([
+      tableResult.refetch(),
+      tableMetadataResult.refetch(),
+      tableDataResult.refetch(),
+    ]);
+  };
+
+  const handleAddColumn = async (column: EditableTableColumnInput) => {
+    try {
+      setAddColumnError(null);
+      const result = await addTableColumn({ tableId, column }).unwrap();
+      await Promise.all([
+        tableResult.refetch(),
+        tableMetadataResult.refetch(),
+        tableDataResult.refetch(),
+      ]);
+      setColumnModalOpen(false);
+      sendToast({
+        message: result.metadata_sync.synced
+          ? t`Column added`
+          : t`Column added, but table metadata could not be synced`,
+        toastColor: result.metadata_sync.synced ? "success" : "warning",
+      });
+    } catch (error) {
+      setAddColumnError(getErrorMessage(error, t`Unable to add this column.`));
+    }
   };
 
   const handleCreate = async (row: EditableTableRow) => {
@@ -204,9 +241,24 @@ export function TableEditPage({ params }: TableEditPageProps) {
                   variant="default"
                   leftSection={<Icon name="refresh" />}
                   onClick={handleRefresh}
-                  loading={tableDataResult.isFetching}
+                  loading={
+                    tableResult.isFetching ||
+                    tableMetadataResult.isFetching ||
+                    tableDataResult.isFetching
+                  }
                 >
                   {t`Refresh`}
+                </Button>
+                <Button
+                  variant="outline"
+                  leftSection={<Icon name="add" />}
+                  onClick={() => {
+                    setAddColumnError(null);
+                    setColumnModalOpen(true);
+                  }}
+                  disabled={!canManageTable}
+                >
+                  {t`Add column`}
                 </Button>
                 <Button
                   leftSection={<Icon name="add" />}
@@ -233,13 +285,18 @@ export function TableEditPage({ params }: TableEditPageProps) {
                 title={t`This table is read-only`}
                 message={t`The current database connection cannot write to this table.`}
               />
-            ) : primaryKeyColumns.length === 0 ? (
-              <TableEditPageError
-                title={t`This table cannot be edited here`}
-                message={t`The editor requires a primary key so it can reliably update and delete rows.`}
-              />
             ) : (
               <>
+                {!canManageRows ? (
+                  <Alert
+                    color="warning"
+                    variant="light"
+                    icon={<Icon name="info" />}
+                  >
+                    {t`Rows cannot be created, updated, or deleted until this table has a primary key.`}
+                  </Alert>
+                ) : null}
+
                 <Group gap="sm">
                   <Badge variant="light">
                     {table.display_name || table.name}
@@ -267,7 +324,9 @@ export function TableEditPage({ params }: TableEditPageProps) {
                       <Stack gap="sm" align="center">
                         <Text fw="700">{t`No rows`}</Text>
                         <Text size="sm" c="text-secondary">
-                          {t`Create the first row for this table from here.`}
+                          {canManageRows
+                            ? t`Create the first row for this table from here.`
+                            : t`This table has no rows to show.`}
                         </Text>
                       </Stack>
                     </Flex>
@@ -313,24 +372,38 @@ export function TableEditPage({ params }: TableEditPageProps) {
                                   gap="xs"
                                   wrap="nowrap"
                                 >
-                                  <ActionIcon
-                                    variant="subtle"
-                                    color="text-secondary"
-                                    onClick={() => setEditingRow(row)}
-                                    aria-label={t`Edit row`}
-                                    tooltip={t`Edit row`}
+                                  <Tooltip
+                                    label={t`Edit row`}
+                                    disabled={!canManageRows}
                                   >
-                                    <Icon name="pencil" />
-                                  </ActionIcon>
-                                  <ActionIcon
-                                    variant="subtle"
-                                    color="error"
-                                    onClick={() => setDeletingRow(row)}
-                                    aria-label={t`Delete row`}
-                                    tooltip={t`Delete row`}
+                                    <span>
+                                      <ActionIcon
+                                        variant="subtle"
+                                        color="text-secondary"
+                                        onClick={() => setEditingRow(row)}
+                                        disabled={!canManageRows}
+                                        aria-label={t`Edit row`}
+                                      >
+                                        <Icon name="pencil" />
+                                      </ActionIcon>
+                                    </span>
+                                  </Tooltip>
+                                  <Tooltip
+                                    label={t`Delete row`}
+                                    disabled={!canManageRows}
                                   >
-                                    <Icon name="trash" />
-                                  </ActionIcon>
+                                    <span>
+                                      <ActionIcon
+                                        variant="subtle"
+                                        color="error"
+                                        onClick={() => setDeletingRow(row)}
+                                        disabled={!canManageRows}
+                                        aria-label={t`Delete row`}
+                                      >
+                                        <Icon name="trash" />
+                                      </ActionIcon>
+                                    </span>
+                                  </Tooltip>
                                 </Group>
                               </td>
                             </tr>
@@ -343,6 +416,19 @@ export function TableEditPage({ params }: TableEditPageProps) {
               </>
             )}
           </Stack>
+
+          {canManageTable && (
+            <AddColumnModal
+              opened={columnModalOpen}
+              error={addColumnError}
+              isLoading={addTableColumnResult.isLoading}
+              onClose={() => {
+                setAddColumnError(null);
+                setColumnModalOpen(false);
+              }}
+              onSubmit={handleAddColumn}
+            />
+          )}
 
           {canManageRows && (
             <>
@@ -382,6 +468,102 @@ export function TableEditPage({ params }: TableEditPageProps) {
         </>
       )}
     </LoadingAndErrorWrapper>
+  );
+}
+
+function AddColumnModal({
+  opened,
+  error,
+  isLoading,
+  onClose,
+  onSubmit,
+}: {
+  opened: boolean;
+  error: string | null;
+  isLoading: boolean;
+  onClose: () => void;
+  onSubmit: (column: EditableTableColumnInput) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [type, setType] = useState<EditableTableColumnType>("text");
+  const [nullable, setNullable] = useState(true);
+
+  useEffect(() => {
+    if (opened) {
+      setName("");
+      setType("text");
+      setNullable(true);
+    }
+  }, [opened]);
+
+  const trimmedName = name.trim();
+  const columnTypeOptions: Array<{
+    value: EditableTableColumnType;
+    label: string;
+  }> = [
+    { value: "text", label: t`Text` },
+    { value: "integer", label: t`Integer` },
+    { value: "decimal", label: t`Decimal` },
+    { value: "boolean", label: t`Boolean` },
+    { value: "date", label: t`Date` },
+    { value: "datetime", label: t`Date and time` },
+  ];
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    await onSubmit({
+      name: trimmedName,
+      type,
+      nullable,
+    });
+  };
+
+  return (
+    <Modal opened={opened} onClose={onClose} title={t`Add column`} centered>
+      <form onSubmit={handleSubmit}>
+        <Stack gap="md">
+          <TextInput
+            label={t`Column name`}
+            value={name}
+            autoFocus
+            required
+            onChange={(event) => setName(event.currentTarget.value)}
+          />
+
+          <Select
+            label={t`Column type`}
+            data={columnTypeOptions}
+            value={type}
+            onChange={(value) => {
+              if (value) {
+                setType(value as EditableTableColumnType);
+              }
+            }}
+          />
+
+          <Checkbox
+            label={t`Allow empty values`}
+            checked={nullable}
+            onChange={(event) => setNullable(event.currentTarget.checked)}
+          />
+
+          {error ? (
+            <Alert color="error" variant="light">
+              {error}
+            </Alert>
+          ) : null}
+
+          <Flex justify="flex-end" gap="sm">
+            <Button variant="subtle" onClick={onClose}>
+              {t`Cancel`}
+            </Button>
+            <Button type="submit" loading={isLoading} disabled={!trimmedName}>
+              {t`Add column`}
+            </Button>
+          </Flex>
+        </Stack>
+      </form>
+    </Modal>
   );
 }
 
@@ -462,7 +644,7 @@ function getCrumbs(
   database: Pick<Database, "id" | "name">,
   table: Pick<Table, "id" | "name" | "display_name" | "schema">,
 ) {
-  const crumbs = [
+  const crumbs: Array<{ title: string; to?: string }> = [
     { title: t`Databases`, to: "/browse/databases" },
     { title: database.name, to: Urls.browseDatabase(database) },
   ];
@@ -478,7 +660,10 @@ function getCrumbs(
 
   crumbs.push({
     title: table.display_name || table.name,
-    to: Urls.table({ id: table.id, name: table.display_name || table.name }),
+    to: Urls.table({
+      id: Number(table.id),
+      name: table.display_name || table.name,
+    }),
   });
   crumbs.push({ title: t`Edit` });
 
