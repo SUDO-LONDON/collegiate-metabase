@@ -2,6 +2,8 @@ import type { TableId } from "metabase-types/api";
 
 import type {
   EditableTableAction,
+  EditableTableColumnDeleteInput,
+  EditableTableColumnDeleteResponse,
   EditableTableColumnInput,
   EditableTableColumnResponse,
   EditableTableFormResponse,
@@ -89,12 +91,35 @@ export const tableEditingApi = Api.injectEndpoints({
           listTag("erd"),
         ]),
     }),
+    deleteTableColumn: builder.mutation<
+      EditableTableColumnDeleteResponse,
+      {
+        tableId: TableId;
+        column: EditableTableColumnDeleteInput;
+      }
+    >({
+      query: ({ tableId, ...body }) => ({
+        method: "POST",
+        url: `/api/table-editing/${tableId}/columns/delete`,
+        body,
+      }),
+      invalidatesTags: (_, error, { tableId }) =>
+        invalidateTags(error, [
+          idTag("table", tableId),
+          listTag("field"),
+          listTag("field-values"),
+          tag("card"),
+          tag("dataset"),
+          listTag("erd"),
+        ]),
+    }),
   }),
 });
 
 export const {
   useAddTableColumnMutation,
   useCreateTableRowMutation,
+  useDeleteTableColumnMutation,
   useDeleteTableRowMutation,
   useDescribeTableEditFormMutation,
   useUpdateTableRowMutation,

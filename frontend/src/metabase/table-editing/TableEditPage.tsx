@@ -12,6 +12,7 @@ import {
 import {
   useAddTableColumnMutation,
   useCreateTableRowMutation,
+  useDeleteTableColumnMutation,
   useDeleteTableRowMutation,
   useUpdateTableRowMutation,
 } from "metabase/api/table-editing";
@@ -79,8 +80,14 @@ export function TableEditPage({ params }: TableEditPageProps) {
   const [columnModalOpen, setColumnModalOpen] = useState(false);
   const [editingRow, setEditingRow] = useState<EditableTableRow | null>(null);
   const [deletingRow, setDeletingRow] = useState<EditableTableRow | null>(null);
+  const [deletingColumn, setDeletingColumn] = useState<DatasetColumn | null>(
+    null,
+  );
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [addColumnError, setAddColumnError] = useState<string | null>(null);
+  const [deleteColumnError, setDeleteColumnError] = useState<string | null>(
+    null,
+  );
 
   const databaseResult = useGetDatabaseQuery(
     hasValidDatabaseId ? { id: databaseId } : skipToken,
@@ -97,6 +104,8 @@ export function TableEditPage({ params }: TableEditPageProps) {
   );
 
   const [addTableColumn, addTableColumnResult] = useAddTableColumnMutation();
+  const [deleteTableColumn, deleteTableColumnResult] =
+    useDeleteTableColumnMutation();
   const [createTableRow, createTableRowResult] = useCreateTableRowMutation();
   const [updateTableRow, updateTableRowResult] = useUpdateTableRowMutation();
   const [deleteTableRow, deleteTableRowResult] = useDeleteTableRowMutation();
@@ -168,6 +177,36 @@ export function TableEditPage({ params }: TableEditPageProps) {
       });
     } catch (error) {
       setAddColumnError(getErrorMessage(error, t`Unable to add this column.`));
+    }
+  };
+
+  const handleDeleteColumn = async () => {
+    if (!deletingColumn) {
+      return;
+    }
+
+    try {
+      setDeleteColumnError(null);
+      const result = await deleteTableColumn({
+        tableId,
+        column: { name: deletingColumn.name },
+      }).unwrap();
+      await Promise.all([
+        tableResult.refetch(),
+        tableMetadataResult.refetch(),
+        tableDataResult.refetch(),
+      ]);
+      setDeletingColumn(null);
+      sendToast({
+        message: result.metadata_sync.synced
+          ? t`Column deleted`
+          : t`Column deleted, but table metadata could not be synced`,
+        toastColor: result.metadata_sync.synced ? "success" : "warning",
+      });
+    } catch (error) {
+      setDeleteColumnError(
+        getErrorMessage(error, t`Unable to delete this column.`),
+      );
     }
   };
 
@@ -319,16 +358,9 @@ export function TableEditPage({ params }: TableEditPageProps) {
                 ) : null}
 
                 <Card withBorder shadow="none" p={0}>
-                  {rowObjects.length === 0 ? (
+                  {columns.length === 0 ? (
                     <Flex align="center" justify="center" py="4rem" px="lg">
-                      <Stack gap="sm" align="center">
-                        <Text fw="700">{t`No rows`}</Text>
-                        <Text size="sm" c="text-secondary">
-                          {canManageRows
-                            ? t`Create the first row for this table from here.`
-                            : t`This table has no rows to show.`}
-                        </Text>
-                      </Stack>
+                      <Text fw="700">{t`No columns`}</Text>
                     </Flex>
                   ) : (
                     <Box style={{ overflowX: "auto" }}>
@@ -341,73 +373,99 @@ export function TableEditPage({ params }: TableEditPageProps) {
                         <thead>
                           <tr>
                             {columns.map((column) => (
-                              <th
+                              <ColumnHeaderCell
                                 key={column.name}
-                                style={tableHeaderCellStyle}
-                              >
-                                {column.display_name || column.name}
-                              </th>
+                                column={column}
+                                isPrimaryKey={primaryKeyFieldNames.has(
+                                  column.name,
+                                )}
+                                canManageTable={canManageTable}
+                                onDelete={(column) => {
+                                  setDeleteColumnError(null);
+                                  setDeletingColumn(column);
+                                }}
+                              />
                             ))}
                             <th style={tableHeaderCellStyle}>{t`Actions`}</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {rowObjects.map((row, index) => (
-                            <tr key={getRowKey(row, primaryKeyColumns, index)}>
-                              {columns.map((column) => (
-                                <td
-                                  key={`${getRowKey(
-                                    row,
-                                    primaryKeyColumns,
-                                    index,
-                                  )}-${column.name}`}
-                                  style={tableBodyCellStyle}
-                                >
-                                  {formatCellValue(row[column.name])}
-                                </td>
-                              ))}
-                              <td style={tableActionsCellStyle}>
-                                <Group
-                                  justify="flex-end"
-                                  gap="xs"
-                                  wrap="nowrap"
-                                >
-                                  <Tooltip
-                                    label={t`Edit row`}
-                                    disabled={!canManageRows}
-                                  >
-                                    <span>
-                                      <ActionIcon
-                                        variant="subtle"
-                                        color="text-secondary"
-                                        onClick={() => setEditingRow(row)}
-                                        disabled={!canManageRows}
-                                        aria-label={t`Edit row`}
-                                      >
-                                        <Icon name="pencil" />
-                                      </ActionIcon>
-                                    </span>
-                                  </Tooltip>
-                                  <Tooltip
-                                    label={t`Delete row`}
-                                    disabled={!canManageRows}
-                                  >
-                                    <span>
-                                      <ActionIcon
-                                        variant="subtle"
-                                        color="error"
-                                        onClick={() => setDeletingRow(row)}
-                                        disabled={!canManageRows}
-                                        aria-label={t`Delete row`}
-                                      >
-                                        <Icon name="trash" />
-                                      </ActionIcon>
-                                    </span>
-                                  </Tooltip>
-                                </Group>
+                          {rowObjects.length === 0 ? (
+                            <tr>
+                              <td
+                                colSpan={columns.length + 1}
+                                style={emptyTableCellStyle}
+                              >
+                                <Stack gap="sm" align="center">
+                                  <Text fw="700">{t`No rows`}</Text>
+                                  <Text size="sm" c="text-secondary">
+                                    {canManageRows
+                                      ? t`Create the first row for this table from here.`
+                                      : t`This table has no rows to show.`}
+                                  </Text>
+                                </Stack>
                               </td>
                             </tr>
-                          ))}
+                          ) : (
+                            rowObjects.map((row, index) => (
+                              <tr
+                                key={getRowKey(row, primaryKeyColumns, index)}
+                              >
+                                {columns.map((column) => (
+                                  <td
+                                    key={`${getRowKey(
+                                      row,
+                                      primaryKeyColumns,
+                                      index,
+                                    )}-${column.name}`}
+                                    style={tableBodyCellStyle}
+                                  >
+                                    {formatCellValue(row[column.name])}
+                                  </td>
+                                ))}
+                                <td style={tableActionsCellStyle}>
+                                  <Group
+                                    justify="flex-end"
+                                    gap="xs"
+                                    wrap="nowrap"
+                                  >
+                                    <Tooltip
+                                      label={t`Edit row`}
+                                      disabled={!canManageRows}
+                                    >
+                                      <span>
+                                        <ActionIcon
+                                          variant="subtle"
+                                          color="text-secondary"
+                                          onClick={() => setEditingRow(row)}
+                                          disabled={!canManageRows}
+                                          aria-label={t`Edit row`}
+                                        >
+                                          <Icon name="pencil" />
+                                        </ActionIcon>
+                                      </span>
+                                    </Tooltip>
+                                    <Tooltip
+                                      label={t`Delete row`}
+                                      disabled={!canManageRows}
+                                    >
+                                      <span>
+                                        <ActionIcon
+                                          variant="subtle"
+                                          color="error"
+                                          onClick={() => setDeletingRow(row)}
+                                          disabled={!canManageRows}
+                                          aria-label={t`Delete row`}
+                                        >
+                                          <Icon name="trash" />
+                                        </ActionIcon>
+                                      </span>
+                                    </Tooltip>
+                                  </Group>
+                                </td>
+                              </tr>
+                            ))
+                          )}
                         </tbody>
                       </table>
                     </Box>
@@ -427,6 +485,20 @@ export function TableEditPage({ params }: TableEditPageProps) {
                 setColumnModalOpen(false);
               }}
               onSubmit={handleAddColumn}
+            />
+          )}
+
+          {canManageTable && (
+            <DeleteColumnModal
+              opened={deletingColumn != null}
+              column={deletingColumn}
+              error={deleteColumnError}
+              isLoading={deleteTableColumnResult.isLoading}
+              onClose={() => {
+                setDeleteColumnError(null);
+                setDeletingColumn(null);
+              }}
+              onConfirm={handleDeleteColumn}
             />
           )}
 
@@ -468,6 +540,52 @@ export function TableEditPage({ params }: TableEditPageProps) {
         </>
       )}
     </LoadingAndErrorWrapper>
+  );
+}
+
+function ColumnHeaderCell({
+  column,
+  isPrimaryKey,
+  canManageTable,
+  onDelete,
+}: {
+  column: DatasetColumn;
+  isPrimaryKey: boolean;
+  canManageTable: boolean;
+  onDelete: (column: DatasetColumn) => void;
+}) {
+  const columnName = column.display_name || column.name;
+
+  return (
+    <th style={tableHeaderCellStyle}>
+      <Group justify="space-between" gap="xs" wrap="nowrap">
+        <Text component="span" size="sm" fw={700}>
+          {columnName}
+        </Text>
+        {canManageTable ? (
+          <Tooltip
+            label={
+              isPrimaryKey
+                ? t`Primary key columns cannot be deleted`
+                : t`Delete column`
+            }
+          >
+            <span>
+              <ActionIcon
+                variant="subtle"
+                size="sm"
+                color="error"
+                disabled={isPrimaryKey}
+                onClick={() => onDelete(column)}
+                aria-label={t`Delete column ${columnName}`}
+              >
+                <Icon name="trash" />
+              </ActionIcon>
+            </span>
+          </Tooltip>
+        ) : null}
+      </Group>
+    </th>
   );
 }
 
@@ -563,6 +681,61 @@ function AddColumnModal({
           </Flex>
         </Stack>
       </form>
+    </Modal>
+  );
+}
+
+function DeleteColumnModal({
+  opened,
+  column,
+  error,
+  isLoading,
+  onClose,
+  onConfirm,
+}: {
+  opened: boolean;
+  column: DatasetColumn | null;
+  error: string | null;
+  isLoading: boolean;
+  onClose: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const columnName = column?.display_name || column?.name || "";
+
+  return (
+    <Modal opened={opened} onClose={onClose} title={t`Delete column`} centered>
+      <Stack gap="md">
+        <Text size="sm" c="text-secondary">
+          {t`This will permanently delete the selected column and all values stored in it.`}
+        </Text>
+
+        {column ? (
+          <Paper p="md" bg="background-secondary" withBorder>
+            <Text size="sm">
+              <Text component="span" fw="700">
+                {t`Column`}
+              </Text>
+              {": "}
+              {columnName}
+            </Text>
+          </Paper>
+        ) : null}
+
+        {error ? (
+          <Alert color="error" variant="light">
+            {error}
+          </Alert>
+        ) : null}
+
+        <Flex justify="flex-end" gap="sm">
+          <Button variant="subtle" onClick={onClose}>
+            {t`Cancel`}
+          </Button>
+          <Button color="error" loading={isLoading} onClick={onConfirm}>
+            {t`Delete column`}
+          </Button>
+        </Flex>
+      </Stack>
     </Modal>
   );
 }
@@ -738,6 +911,12 @@ const tableBodyCellStyle: CSSProperties = {
   maxWidth: 280,
   verticalAlign: "top",
   wordBreak: "break-word",
+};
+
+const emptyTableCellStyle: CSSProperties = {
+  ...tableBodyCellStyle,
+  padding: "4rem 1rem",
+  textAlign: "center",
 };
 
 const tableActionsCellStyle: CSSProperties = {

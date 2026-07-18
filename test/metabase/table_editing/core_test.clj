@@ -109,6 +109,20 @@
             {:name "asset lookup"}
             {:name "arrival_count" :type :integer :nullable false})))))
 
+(deftest drop-column-sql-test
+  (testing "Postgres identifiers are quoted"
+    (is (= "ALTER TABLE \"public\".\"asset lookup\" DROP COLUMN \"daily notes\""
+           (#'table-editing/drop-column-sql
+            :postgres
+            {:schema "public" :name "asset lookup"}
+            "daily notes"))))
+  (testing "MySQL identifiers are quoted"
+    (is (= "ALTER TABLE `asset lookup` DROP COLUMN `arrival_count`"
+           (#'table-editing/drop-column-sql
+            :mysql
+            {:name "asset lookup"}
+            "arrival_count")))))
+
 (deftest add-column!-test
   (testing "adds a column and syncs table metadata"
     (let [executed-sql (atom nil)
@@ -142,3 +156,34 @@
            #"A column with this name already exists"
            (table-editing/add-column! 42 {:name "notes"
                                           :type :text}))))))
+
+(deftest delete-column!-test
+  (testing "deletes a column and syncs table metadata"
+    (let [executed-sql (atom nil)
+          synced-table (atom nil)]
+      (with-redefs [table-editing/editable-table-context! (constantly {:database {:id 1 :engine :postgres}
+                                                                       :table    {:id 42
+                                                                                  :schema "public"
+                                                                                  :name "asset lookup"}})
+                    metabase.table-editing.core/table-fields (constantly [{:name "id" :semantic_type :type/PK}
+                                                                          {:name "notes"}])
+                    metabase.table-editing.core/execute-ddl! (fn [_database sql]
+                                                               (reset! executed-sql sql))
+                    metabase.table-editing.core/sync-table-metadata-result (fn [table]
+                                                                             (reset! synced-table table)
+                                                                             {:synced true})]
+        (is (= {:success       true
+                :column        {:name "notes"}
+                :metadata_sync {:synced true}}
+               (table-editing/delete-column! 42 {:name " notes "})))
+        (is (= "ALTER TABLE \"public\".\"asset lookup\" DROP COLUMN \"notes\""
+               @executed-sql))
+        (is (= {:id 42 :schema "public" :name "asset lookup"} @synced-table)))))
+  (testing "rejects primary key columns"
+    (with-redefs [table-editing/editable-table-context! (constantly {:database {:id 1 :engine :postgres}
+                                                                     :table    {:id 42 :name "asset_lookup"}})
+                  metabase.table-editing.core/table-fields (constantly [{:name "id" :semantic_type :type/PK}])]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"Primary key columns cannot be deleted"
+           (table-editing/delete-column! 42 {:name "id"}))))))

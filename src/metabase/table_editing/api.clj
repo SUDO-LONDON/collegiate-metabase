@@ -25,6 +25,10 @@
    [:type ::column-type]
    [:nullable {:optional true} [:maybe :boolean]]])
 
+(mr/def ::delete-column
+  [:map
+   [:name ms/NonBlankString]])
+
 (mr/def ::describe-form-response
   [:map
    [:title :string]
@@ -66,6 +70,13 @@
              [:name :string]
              [:type ::column-type]
              [:nullable :boolean]]]
+   [:metadata_sync ::metadata-sync-response]])
+
+(mr/def ::delete-column-response
+  [:map
+   [:success [:= true]]
+   [:column [:map
+             [:name :string]]]
    [:metadata_sync ::metadata-sync-response]])
 
 (defn- parse-action [action]
@@ -126,5 +137,16 @@
   (perms/check-has-application-permission :setting)
   (api/check-superuser)
   (table-editing/add-column! table-id (update column :type keyword)))
+
+(api.macros/defendpoint :post "/:table-id/columns/delete" :- ::delete-column-response
+  "Delete a column from an allowlisted table."
+  [{:keys [table-id]} :- [:map
+                          [:table-id ms/PositiveInt]]
+   _query-params
+   {:keys [column]} :- [:map
+                        [:column ::delete-column]]]
+  (perms/check-has-application-permission :setting)
+  (api/check-superuser)
+  (table-editing/delete-column! table-id column))
 
 (def ^:private keep-me ::keep-me)

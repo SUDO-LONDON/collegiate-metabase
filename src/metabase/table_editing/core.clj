@@ -131,6 +131,22 @@
                     {:status-code 400})))
   column-name)
 
+(defn- validate-existing-column-name!
+  [column-name]
+  (cond
+    (str/blank? column-name)
+    (throw (ex-info (tru "Column name is required.")
+                    {:status-code 400}))
+
+    (> (count column-name) 128)
+    (throw (ex-info (tru "Column name must be 128 characters or fewer.")
+                    {:status-code 400}))
+
+    (re-find #"\p{Cntrl}" column-name)
+    (throw (ex-info (tru "Column name cannot contain control characters.")
+                    {:status-code 400})))
+  column-name)
+
 (defn- validate-column-type!
   [column-type]
   (when-not (contains? editable-column-types column-type)
@@ -148,6 +164,24 @@
       (throw (ex-info (tru "A column with this name already exists.")
                       {:status-code 400
                        :column      column-name})))))
+
+(defn- column-field
+  [fields column-name]
+  (some #(when (= (:name %) column-name) %) fields))
+
+(defn- existing-column-field!
+  [fields column-name]
+  (or (column-field fields column-name)
+      (throw (ex-info (tru "Column not found.")
+                      {:status-code 404
+                       :column      column-name}))))
+
+(defn- check-column-droppable!
+  [field]
+  (when (= :type/PK (:semantic_type field))
+    (throw (ex-info (tru "Primary key columns cannot be deleted.")
+                    {:status-code 400
+                     :column      (:name field)}))))
 
 (defn- supported-ddl-driver?
   [driver]
@@ -175,11 +209,17 @@
           (column-type-sql driver type)
           (if nullable "" " NOT NULL")))
 
+(defn- drop-column-sql
+  [driver table column-name]
+  (format "ALTER TABLE %s DROP COLUMN %s"
+          (qualified-table-name driver table)
+          (quote-ident driver column-name)))
+
 (defn- execute-ddl!
   [database sql]
   (let [database-driver (driver.u/database->driver database)]
     (when-not (supported-ddl-driver? database-driver)
-      (throw (ex-info (tru "Adding columns is only supported for PostgreSQL and MySQL tables.")
+      (throw (ex-info (tru "Editing columns is only supported for PostgreSQL and MySQL tables.")
                       {:status-code 400
                        :driver      database-driver})))
     (driver/execute-raw-queries! database-driver (:id database) [[sql nil]])))
@@ -190,7 +230,7 @@
     (sync-metadata/sync-table-metadata! table)
     {:synced true}
     (catch Throwable e
-      (log/warn e "Unable to sync table metadata after adding a column")
+      (log/warn e "Unable to sync table metadata after editing columns")
       {:synced false
        :error  (or (ex-message e) (str e))})))
 
@@ -232,6 +272,31 @@
      :column        {:name     column-name
                      :type     (name column-type)
                      :nullable nullable?}
+     :metadata_sync (sync-table-metadata-result table)}))
+
+(mu/defn delete-column! :- [:map
+                            [:success [:= true]]
+                            [:column [:map
+                                      [:name :string]]]
+                            [:metadata_sync [:map
+                                             [:synced :boolean]
+                                             [:error {:optional true} :string]]]]
+  "Delete a non-primary-key column from an editable table and sync Metabase metadata for that table."
+  [table-id :- pos-int?
+   column   :- [:map
+                [:name :string]]]
+  (let [{:keys [database table]} (editable-table-context! table-id)
+        database-driver          (driver.u/database->driver database)
+        column-name              (validate-existing-column-name! (normalize-column-name (:name column)))
+        field                    (existing-column-field! (table-fields table-id) column-name)]
+    (when-not (supported-ddl-driver? database-driver)
+      (throw (ex-info (tru "Editing columns is only supported for PostgreSQL and MySQL tables.")
+                      {:status-code 400
+                       :driver      database-driver})))
+    (check-column-droppable! field)
+    (execute-ddl! database (drop-column-sql database-driver table column-name))
+    {:success       true
+     :column        {:name column-name}
      :metadata_sync (sync-table-metadata-result table)}))
 
 (defn- input-type

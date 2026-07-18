@@ -18,9 +18,22 @@ export type EditableTableColumnInput = {
   nullable: boolean;
 };
 
+export type EditableTableColumnDeleteInput = {
+  name: string;
+};
+
 export type EditableTableColumnResponse = {
   success: true;
   column: EditableTableColumnInput;
+  metadata_sync: {
+    synced: boolean;
+    error?: string;
+  };
+};
+
+export type EditableTableColumnDeleteResponse = {
+  success: true;
+  column: EditableTableColumnDeleteInput;
   metadata_sync: {
     synced: boolean;
     error?: string;
