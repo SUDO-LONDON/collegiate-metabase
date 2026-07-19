@@ -14,6 +14,7 @@
 
 (def ^:private page-size 1000)
 (def ^:private timeout-ms 60000)
+(def ^:private report-timeout-ms (* 30 60 1000))
 (def ^:private max-records-per-table 5000000)
 
 (defn- base-url []
@@ -21,12 +22,13 @@
 
 (defn- request-opts
   "Common clj-http options including Basic Auth credentials."
-  []
-  {:basic-auth         [(starrez.settings/starrez-api-username)
-                        (starrez.settings/starrez-api-token)]
-   :socket-timeout     timeout-ms
-   :connection-timeout timeout-ms
-   :throw-exceptions   false})
+  ([] (request-opts timeout-ms))
+  ([socket-timeout-ms]
+   {:basic-auth         [(starrez.settings/starrez-api-username)
+                         (starrez.settings/starrez-api-token)]
+    :socket-timeout     socket-timeout-ms
+    :connection-timeout timeout-ms
+    :throw-exceptions   false}))
 
 (defn- table-url [table]
   (when-let [base (base-url)]
@@ -156,7 +158,7 @@
       {:ok false :error err})
     (try
       (let [resp (http/get (report-url report-id :csv)
-                           (assoc (request-opts) :as :string))]
+                           (assoc (request-opts report-timeout-ms) :as :string))]
         (if (<= 200 (or (:status resp) 0) 299)
           {:ok true :body (:body resp)}
           (let [error (str "StarRez report " report-id " returned HTTP " (:status resp)
