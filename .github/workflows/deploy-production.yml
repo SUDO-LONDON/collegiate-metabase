@@ -107,10 +107,11 @@ jobs:
             APP_DB_MAX=${APP_DB_STATS%%|*}
             APP_DB_AVAILABLE=${APP_DB_STATS##*|}
             echo "Application PostgreSQL connections: max=$APP_DB_MAX available=$APP_DB_AVAILABLE"
-            if [ "$APP_DB_MAX" -lt 40 ]; then
-              echo "Refusing to deploy a 30-connection Metabase pool unless PostgreSQL can retain a 10-connection reserve."
+            if [ "$APP_DB_MAX" -lt 30 ]; then
+              echo "Refusing to deploy a 20-connection Metabase pool unless PostgreSQL can retain a 10-connection reserve."
               exit 1
             fi
+            docker image prune -af
             $COMPOSE pull
             if [ "$LEGACY_COMPOSE" = "true" ]; then
               # docker-compose v1 can crash with KeyError: ContainerConfig when
