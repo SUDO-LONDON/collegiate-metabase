@@ -127,6 +127,15 @@
   For setting the maximum,
   see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_application_db_max_connection_pool_size).")
 
+(defsetting jdbc-data-warehouse-min-connection-pool-size
+  "Minimum size of the c3p0 connection pool."
+  :visibility :internal
+  :type       :integer
+  :default    0
+  :audit      :getter
+  :doc "Keep this many connections ready for each data warehouse. Increase this only when connection setup is
+  measurably delaying concurrent queries, and keep it below [[jdbc-data-warehouse-max-connection-pool-size]].")
+
 (def ^:dynamic ^Long *query-timeout-ms*
   "Maximum amount of time query is allowed to run, in ms."
   (u/minutes->ms (db-query-timeout-minutes)))

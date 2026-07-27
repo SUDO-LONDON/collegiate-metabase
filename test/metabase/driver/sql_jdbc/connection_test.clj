@@ -390,6 +390,13 @@
     (is (=? {"unreturnedConnectionTimeout" integer?}
             (sql-jdbc.conn/data-warehouse-connection-pool-properties :h2 (mt/db))))))
 
+(deftest data-warehouse-min-connection-pool-size-test
+  (testing "The configured minimum is used for both minimum and initial pool sizes"
+    (mt/with-temp-env-var-value! [mb-jdbc-data-warehouse-min-connection-pool-size "8"]
+      (is (=? {"minPoolSize"     8
+               "initialPoolSize" 8}
+              (sql-jdbc.conn/data-warehouse-connection-pool-properties :h2 (mt/db)))))))
+
 (deftest unreturned-connection-timeout-test
   (testing "We should be able to set jdbc-data-warehouse-unreturned-connection-timeout-seconds via env var (#33646)"
     (mt/with-temp-env-var-value! [mb-jdbc-data-warehouse-unreturned-connection-timeout-seconds "20"]

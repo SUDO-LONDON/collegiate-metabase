@@ -102,8 +102,8 @@
    "maxIdleTime"                          (* 3 60 60) ; 3 hours
    ;; In the case of serverless databases, we don't want to periodically
    ;; wake them up to keep a connection open (#58373).
-   "minPoolSize"                          0
-   "initialPoolSize"                      0
+   "minPoolSize"                          (driver.settings/jdbc-data-warehouse-min-connection-pool-size)
+   "initialPoolSize"                      (driver.settings/jdbc-data-warehouse-min-connection-pool-size)
    "maxPoolSize"                          (driver.settings/jdbc-data-warehouse-max-connection-pool-size)
    ;; [From dox] If true, an operation will be performed at every connection checkout to verify that the connection is
    ;; valid. [...] ;; Testing Connections in checkout is the simplest and most reliable form of Connection testing,
