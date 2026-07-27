@@ -81,7 +81,7 @@ jobs:
             MB_DB_DBNAME=${{ secrets.MB_DB_DBNAME }}
             MB_DB_USER=${{ secrets.MB_DB_USER }}
             MB_DB_PASS=${{ secrets.MB_DB_PASS }}
-            MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE=30
+            MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE=40
             MB_JDBC_DATA_WAREHOUSE_MIN_CONNECTION_POOL_SIZE=8
             MB_ENCRYPTION_SECRET_KEY=${{ secrets.MB_ENCRYPTION_SECRET_KEY }}
             ENV
@@ -107,8 +107,8 @@ jobs:
             APP_DB_MAX=${APP_DB_STATS%%|*}
             APP_DB_AVAILABLE=${APP_DB_STATS##*|}
             echo "Application PostgreSQL connections: max=$APP_DB_MAX available=$APP_DB_AVAILABLE"
-            if [ "$APP_DB_MAX" -lt 40 ]; then
-              echo "Refusing to deploy a 30-connection Metabase pool unless PostgreSQL can retain a 10-connection reserve."
+            if [ "$APP_DB_MAX" -lt 50 ]; then
+              echo "Refusing to deploy a 40-connection Metabase pool unless PostgreSQL can retain a 10-connection reserve."
               exit 1
             fi
             $COMPOSE pull
