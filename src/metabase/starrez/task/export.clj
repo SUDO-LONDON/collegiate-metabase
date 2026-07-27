@@ -59,6 +59,8 @@
               (keep failed-report-error (get-in result [:merge :reports]))
               [(when-let [error (get-in result [:activation :error])]
                  (str "Live table activation: " error))
+               (when-let [error (get-in result [:performance_cache :error])]
+                 (str "Weekly Net Bookings cache: " error))
                (when-let [error (:error metadata-sync)]
                  (str "Metabase metadata sync: " error))])))))
 
@@ -84,7 +86,9 @@
              :snapshots_total  (count (:snapshots result))
              :errors           errors}
       metadata-sync
-      (assoc :metadata_sync (select-keys metadata-sync [:database_id :synced :error])))))
+      (assoc :metadata_sync (select-keys metadata-sync [:database_id :synced :error]))
+      (:performance_cache result)
+      (assoc :performance_cache (:performance_cache result)))))
 
 (defn- scheduled-refresh-failure-status
   [started-at e]

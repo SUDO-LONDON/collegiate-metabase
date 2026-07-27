@@ -34,6 +34,7 @@
                       :pg_database                   (starrez.settings/starrez-pg-database)
                       :metabase_database_id          (starrez.settings/starrez-metabase-database-id)}
      :report_refresh (starrez.db/report-refresh-selection configured-report-ids)
+     :performance_cache (starrez.settings/starrez-performance-cache-status)
      :scheduled_refresh {:cron     starrez.task.export/scheduled-export-cron
                          :last_run (starrez.settings/starrez-scheduled-refresh-status)}}))
 

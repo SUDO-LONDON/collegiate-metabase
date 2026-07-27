@@ -151,6 +151,13 @@
                      (starrez.storage/download-export sas-url blob-name))]
     (starrez.db/activate-week! snapshot-id downloader)))
 
+(defn- source-refresh-succeeded?
+  [{:keys [results merge activation]}]
+  (and (seq results)
+       (every? :success results)
+       (not-any? :error (:reports merge))
+       (not (:error activation))))
+
 (defn run-export
   "Export all configured StarRez tables and reports to blob storage,
   then record snapshots and cumulatively merge report rows by `booking_id`.
@@ -185,14 +192,20 @@
                                     (activate-table-snapshot! table-snapshot-id)
                                     (when (seq (successful-table-blob-files results))
                                       {:error (str "Table exports succeeded, but no snapshot was recorded. "
-                                                   "Live StarRez tables were not activated.")})))]
-         (cond-> {:results      (mapv public-export-result results)
-                  :snapshots    (:ids snapshot-details)
-                  :merge        merge-result
-                  :completed_at (completed-at-str)}
-           (:table-snapshot-id snapshot-details)
-           (assoc :table_snapshot_id (:table-snapshot-id snapshot-details))
-           (some? activation-result)
-           (assoc :activation activation-result)))
+                                                   "Live StarRez tables were not activated.")})))
+             base-result        {:results      (mapv public-export-result results)
+                                 :snapshots    (:ids snapshot-details)
+                                 :merge        merge-result
+                                 :completed_at (completed-at-str)}
+             base-result        (cond-> base-result
+                                  (:table-snapshot-id snapshot-details)
+                                  (assoc :table_snapshot_id (:table-snapshot-id snapshot-details))
+                                  (some? activation-result)
+                                  (assoc :activation activation-result))
+             cache-result       (when (source-refresh-succeeded? base-result)
+                                  (starrez.db/refresh-weekly-net-bookings-fact-cache!))]
+         (cond-> base-result
+           cache-result
+           (assoc :performance_cache cache-result)))
        (finally
          (reset! export-running? false))))))

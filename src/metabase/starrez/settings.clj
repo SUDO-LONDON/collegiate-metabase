@@ -117,6 +117,14 @@
   :export?    false
   :audit      :no-value)
 
+(defsetting starrez-performance-cache-status
+  (deferred-tru "Status of the last Weekly Net Bookings cache refresh")
+  :encryption :no
+  :visibility :admin
+  :type       :json
+  :export?    false
+  :audit      :no-value)
+
 (defn csv-setting-values
   "Return a normalized vector of values from a StarRez comma-separated or CSV setting."
   [setting-value]

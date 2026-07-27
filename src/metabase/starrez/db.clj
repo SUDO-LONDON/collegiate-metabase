@@ -16,6 +16,7 @@
   (:require
    [cheshire.core :as json]
    [clojure.data.csv :as csv]
+   [clojure.java.io :as io]
    [clojure.string :as str]
    [metabase.starrez.settings :as starrez.settings]
    [metabase.sync.sync-metadata :as sync-metadata]
@@ -25,6 +26,7 @@
    [toucan2.core :as t2])
   (:import
    (java.io StringReader StringWriter)
+   (java.time OffsetDateTime)
    (org.postgresql.copy CopyManager)
    (org.postgresql.core BaseConnection)))
 
@@ -36,6 +38,23 @@
 (def ^:private report-merge-key "booking_id")
 (def ^:private technical-row-id-column "_metabase_row_id")
 (def ^:private postgres-max-columns 1600)
+(def ^:private weekly-net-bookings-cache-table "models.weekly_net_bookings_fact_cache")
+(def ^:private weekly-net-bookings-staging-table "models.weekly_net_bookings_fact_cache_staging")
+(def ^:private weekly-net-bookings-cache-lock 903128)
+(def ^:private weekly-net-bookings-columns
+  ["term_session_code"
+   "week_of_leasing_cycle"
+   "room_location_description"
+   "portfolio"
+   "client"
+   "hoo"
+   "booking_channel"
+   "nationality_description"
+   "weeks_leased"
+   "like_for_like_eligible"
+   "gross_bookings"
+   "cancelled_bookings"
+   "net_bookings"])
 
 (defn- configured? []
   (and (seq (starrez.settings/starrez-pg-host))
@@ -71,6 +90,127 @@
       {:ok true :message "Connected to StarRez Postgres successfully"}
       (catch Exception e
         {:ok false :error (ex-message e)}))))
+
+(defn- weekly-net-bookings-query []
+  (or (some-> (io/resource "metabase/starrez/weekly_net_bookings_fact.sql") slurp)
+      (throw (ex-info "Weekly Net Bookings cache SQL resource is missing" {}))))
+
+(defn- cache-summary
+  [conn table-name]
+  (jdbc/execute-one!
+   conn
+   [(format (str "SELECT COUNT(*) AS row_count,"
+                 " COALESCE(SUM(gross_bookings), 0) AS gross_bookings,"
+                 " COALESCE(SUM(cancelled_bookings), 0) AS cancelled_bookings,"
+                 " COALESCE(SUM(net_bookings), 0) AS net_bookings"
+                 " FROM %s")
+            table-name)]
+   {:builder-fn rs/as-unqualified-lower-maps}))
+
+(defn- cache-columns
+  [conn table-name]
+  (let [[schema table] (str/split table-name #"\." 2)]
+    (mapv :column_name
+          (jdbc/execute!
+           conn
+           ["SELECT column_name
+             FROM information_schema.columns
+             WHERE table_schema = ? AND table_name = ?
+             ORDER BY ordinal_position"
+            schema table]
+           {:builder-fn rs/as-unqualified-lower-maps}))))
+
+(defn- validate-cache-staging!
+  [conn]
+  (let [columns (cache-columns conn weekly-net-bookings-staging-table)
+        summary (cache-summary conn weekly-net-bookings-staging-table)]
+    (when-not (= weekly-net-bookings-columns columns)
+      (throw (ex-info "Weekly Net Bookings cache has unexpected columns"
+                      {:expected weekly-net-bookings-columns :actual columns})))
+    (when (zero? (:row_count summary))
+      (throw (ex-info "Weekly Net Bookings cache query returned no rows" summary)))
+    (when-not (= (:net_bookings summary)
+                 (- (:gross_bookings summary) (:cancelled_bookings summary)))
+      (throw (ex-info "Weekly Net Bookings cache totals failed validation" summary)))
+    summary))
+
+(defn- ensure-weekly-net-bookings-cache!
+  [conn]
+  (jdbc/execute! conn ["CREATE SCHEMA IF NOT EXISTS models"])
+  (jdbc/execute!
+   conn
+   [(format "CREATE TABLE IF NOT EXISTS %s (LIKE %s INCLUDING ALL)"
+            weekly-net-bookings-cache-table
+            weekly-net-bookings-staging-table)])
+  (doseq [ddl [(format "CREATE INDEX IF NOT EXISTS weekly_net_bookings_cache_week_term_idx ON %s (week_of_leasing_cycle, term_session_code)"
+                       weekly-net-bookings-cache-table)
+               (format "CREATE INDEX IF NOT EXISTS weekly_net_bookings_cache_term_property_idx ON %s (term_session_code, room_location_description)"
+                       weekly-net-bookings-cache-table)
+               (format "CREATE INDEX IF NOT EXISTS weekly_net_bookings_cache_portfolio_idx ON %s (portfolio)"
+                       weekly-net-bookings-cache-table)
+               (format "CREATE INDEX IF NOT EXISTS weekly_net_bookings_cache_client_idx ON %s (client)"
+                       weekly-net-bookings-cache-table)
+               (format "CREATE INDEX IF NOT EXISTS weekly_net_bookings_cache_hoo_idx ON %s (hoo)"
+                       weekly-net-bookings-cache-table)
+               (format "CREATE INDEX IF NOT EXISTS weekly_net_bookings_cache_channel_idx ON %s (booking_channel)"
+                       weekly-net-bookings-cache-table)]]
+    (jdbc/execute! conn [ddl])))
+
+(defn- record-cache-status!
+  [status]
+  (try
+    (starrez.settings/starrez-performance-cache-status! status)
+    (catch Throwable e
+      (log/warn e "Unable to record Weekly Net Bookings cache status"))))
+
+(defn refresh-weekly-net-bookings-fact-cache!
+  "Build and validate the Weekly Net Bookings cache before replacing its active snapshot.
+  A failed build leaves the previous completed snapshot untouched."
+  []
+  (let [started-ns (System/nanoTime)
+        started-at (str (OffsetDateTime/now))]
+    (record-cache-status! {:status "running" :started_at started-at})
+    (try
+      (with-open [conn (get-connection)]
+        (jdbc/execute! conn [(str "SELECT pg_advisory_lock(" weekly-net-bookings-cache-lock ")")])
+        (try
+          (jdbc/execute! conn [(str "DROP TABLE IF EXISTS " weekly-net-bookings-staging-table)])
+          (jdbc/execute! conn [(str "CREATE TABLE " weekly-net-bookings-staging-table
+                                    " AS " (weekly-net-bookings-query))])
+          (let [summary (validate-cache-staging! conn)]
+            (ensure-weekly-net-bookings-cache! conn)
+            (jdbc/with-transaction [tx conn]
+              (jdbc/execute! tx [(str "LOCK TABLE " weekly-net-bookings-cache-table
+                                      " IN ACCESS EXCLUSIVE MODE")])
+              (jdbc/execute! tx [(str "TRUNCATE TABLE " weekly-net-bookings-cache-table)])
+              (jdbc/execute! tx [(format "INSERT INTO %s SELECT * FROM %s"
+                                         weekly-net-bookings-cache-table
+                                         weekly-net-bookings-staging-table)])
+              (let [active-summary (cache-summary tx weekly-net-bookings-cache-table)]
+                (when-not (= summary active-summary)
+                  (throw (ex-info "Weekly Net Bookings active cache does not match staging totals"
+                                  {:staging summary :active active-summary})))))
+            (jdbc/execute! conn [(str "ANALYZE " weekly-net-bookings-cache-table)])
+            (jdbc/execute! conn [(str "DROP TABLE " weekly-net-bookings-staging-table)])
+            (let [status (merge
+                          {:status       "completed"
+                           :started_at   started-at
+                           :completed_at (str (OffsetDateTime/now))
+                           :duration_ms  (quot (- (System/nanoTime) started-ns) 1000000)}
+                          summary)]
+              (record-cache-status! status)
+              status))
+          (finally
+            (jdbc/execute! conn [(str "SELECT pg_advisory_unlock(" weekly-net-bookings-cache-lock ")")]))))
+      (catch Exception e
+        (let [status {:status       "failed"
+                      :started_at   started-at
+                      :completed_at (str (OffsetDateTime/now))
+                      :duration_ms  (quot (- (System/nanoTime) started-ns) 1000000)
+                      :error        (ex-message e)}]
+          (log/error e "Weekly Net Bookings cache refresh failed; retaining previous snapshot")
+          (record-cache-status! status)
+          status)))))
 
 (def ^:private bootstrap-ddl
   [(str "CREATE SCHEMA IF NOT EXISTS " data-schema)

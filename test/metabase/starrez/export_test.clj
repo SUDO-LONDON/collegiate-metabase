@@ -6,7 +6,14 @@
    [metabase.starrez.settings :as starrez.settings]))
 
 (defn- without-completed-at [result]
-  (dissoc result :completed_at))
+  (dissoc result :completed_at :performance_cache))
+
+(use-fixtures
+  :each
+  (fn [f]
+    (with-redefs [starrez.db/refresh-weekly-net-bookings-fact-cache!
+                  (constantly {:status "completed" :row_count 10})]
+      (f))))
 
 (deftest record-export-snapshots-keeps-reports-separate
   (let [recorded (atom [])]
@@ -226,3 +233,32 @@
       (is (= ["59906" "62751"] @requested-report-ids))
       (is (= ["59906" "62751"] (:report-ids @merged)))
       (is (every? :csv_body (:results @merged))))))
+
+(deftest successful-export-refreshes-performance-cache
+  (let [refresh-count (atom 0)]
+    (with-redefs [starrez.settings/starrez-export-tables (constantly "Entry")
+                  starrez.settings/starrez-export-reports (constantly "")
+                  starrez.export/export-table
+                  (constantly {:kind :table :name "Entry" :blob_name "entry.csv" :success true})
+                  starrez.db/record-export-week! (constantly 42)
+                  starrez.db/refresh-weekly-net-bookings-fact-cache!
+                  (fn []
+                    (swap! refresh-count inc)
+                    {:status "completed" :row_count 10})]
+      (is (= {:status "completed" :row_count 10}
+             (:performance_cache (starrez.export/run-export))))
+      (is (= 1 @refresh-count)))))
+
+(deftest failed-export-does-not-refresh-performance-cache
+  (let [refresh-count (atom 0)]
+    (with-redefs [starrez.settings/starrez-export-tables (constantly "Entry")
+                  starrez.settings/starrez-export-reports (constantly "")
+                  starrez.export/export-table
+                  (constantly {:kind :table :name "Entry" :blob_name "entry.csv" :success false})
+                  starrez.db/record-export-week! (constantly 42)
+                  starrez.db/refresh-weekly-net-bookings-fact-cache!
+                  (fn []
+                    (swap! refresh-count inc)
+                    {:status "completed"})]
+      (is (nil? (:performance_cache (starrez.export/run-export))))
+      (is (zero? @refresh-count)))))
