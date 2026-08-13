@@ -297,6 +297,9 @@
                   starrez.db/ensure-technical-primary-key!
                   (fn [_conn table-name]
                     (swap! calls conj [:ensure-primary-key table-name]))
+                  starrez.db/drop-booking-id-index!
+                  (fn [_conn table-name]
+                    (swap! calls conj [:drop-booking-index table-name]))
                   starrez.db/truncate-table!
                   (fn [_conn table-name]
                     (swap! calls conj [:truncate table-name]))
@@ -316,6 +319,7 @@
               true)))
       (is (= [[:add-missing "table_65521" ["booking_id" "room" "new_col"]]
               [:ensure-primary-key "table_65521"]
+              [:drop-booking-index "table_65521"]
               [:truncate "table_65521"]
               [:copy "\"starrez_data\".\"table_65521\"" ["booking_id" "room" "new_col"] [["123" "A" "yes"]]]]
              @calls)))))
@@ -376,6 +380,15 @@
                     (swap! queries conj sql))]
       (#'starrez.db/ensure-booking-id-index! nil "table_59906")
       (is (= ["CREATE UNIQUE INDEX IF NOT EXISTS \"table_59906_booking_id_uniq\" ON \"starrez_data\".\"table_59906\" (\"booking_id\")"]
+             @queries)))))
+
+(deftest drop-booking-id-index-removes-the-merge-only-index
+  (let [queries (atom [])]
+    (with-redefs [jdbc/execute!
+                  (fn [_conn [sql]]
+                    (swap! queries conj sql))]
+      (#'starrez.db/drop-booking-id-index! nil "table_65526")
+      (is (= ["DROP INDEX IF EXISTS \"starrez_data\".\"table_65526_booking_id_uniq\""]
              @queries)))))
 
 (deftest sync-metabase-schema-syncs-matched-database

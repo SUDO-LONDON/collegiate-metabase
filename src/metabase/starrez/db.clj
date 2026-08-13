@@ -654,6 +654,11 @@
                               (quote-ident index-name)
                               " ON " tbl " (" booking-col ")")])))
 
+(defn- drop-booking-id-index! [conn table-name]
+  (let [index-name (str table-name "_" report-merge-key "_uniq")]
+    (jdbc/execute! conn [(str "DROP INDEX IF EXISTS "
+                              (qualified-table-name data-schema index-name))])))
+
 (defn- create-staging-table! [conn columns]
   (let [table-name (str "starrez_report_merge_" (str/replace (str (random-uuid)) "-" ""))
         tbl        (quote-ident table-name)
@@ -707,6 +712,7 @@
 (defn- replace-existing-report-table! [conn destination-table columns rows]
   (let [added-columns (add-missing-columns! conn destination-table columns)
         _             (ensure-technical-primary-key! conn destination-table)
+        _             (drop-booking-id-index! conn destination-table)
         destination   (qualified-table-name data-schema destination-table)]
     (truncate-table! conn destination-table)
     (when (seq rows)
