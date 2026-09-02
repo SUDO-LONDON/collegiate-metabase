@@ -26,6 +26,7 @@ import {
 import {
   Alert,
   Badge,
+  Box,
   Button,
   Checkbox,
   Flex,
@@ -34,10 +35,76 @@ import {
   Paper,
   Stack,
   Text,
+  TextInput,
   Title,
 } from "metabase/ui";
+import type { EnterpriseSettingKey } from "metabase-types/api";
+
+import { SettingHeader } from "../SettingHeader";
 
 const EMPTY_REPORT_IDS: string[] = [];
+
+type StarRezSecretSettingKey = Extract<
+  EnterpriseSettingKey,
+  "starrez-api-token" | "starrez-blob-sas-url" | "starrez-pg-password"
+>;
+
+function StarRezSecretSettingInput({
+  name,
+  title,
+  description,
+  placeholder,
+  configured,
+  onSaved,
+}: {
+  name: StarRezSecretSettingKey;
+  title: string;
+  description: string;
+  placeholder: string;
+  configured?: boolean;
+  onSaved: () => Promise<unknown> | unknown;
+}) {
+  const [value, setValue] = useState("");
+  const [updateSetting, { isLoading, isError }] = useUpdateSettingMutation();
+
+  const saveReplacement = async () => {
+    if (value.trim() === "") {
+      return;
+    }
+
+    try {
+      await updateSetting({ key: name, value }).unwrap();
+      setValue("");
+      await onSaved();
+    } catch {
+      // Keep the replacement in the field so the admin can retry.
+    }
+  };
+
+  return (
+    <Box data-testid={`${name}-setting`}>
+      <SettingHeader id={name} title={title} description={description} />
+      <Stack gap="xs">
+        <TextInput
+          id={name}
+          value={value}
+          placeholder={placeholder}
+          onChange={(event) => setValue(event.target.value)}
+          onBlur={saveReplacement}
+          type="password"
+          disabled={isLoading}
+        />
+        <Text size="xs" c={isError ? "error" : "text-secondary"}>
+          {isError
+            ? t`The replacement could not be saved.`
+            : configured
+              ? t`Configured. Enter a new value to replace it.`
+              : t`Not configured.`}
+        </Text>
+      </Stack>
+    </Box>
+  );
+}
 
 function getSnapshotLabel(blobFiles: Record<string, string>) {
   const keys = Object.keys(blobFiles);
@@ -337,7 +404,13 @@ function ExportResultSummary({ result }: { result: StarRezExportResult }) {
   );
 }
 
-function ConfigSection() {
+function ConfigSection({
+  status,
+  onStatusChanged,
+}: {
+  status?: StarRezStatus;
+  onStatusChanged: () => Promise<unknown> | unknown;
+}) {
   const [testConnection, { isLoading: testing, data: testResult }] =
     useTestStarRezConnectionMutation();
 
@@ -360,20 +433,22 @@ function ConfigSection() {
           inputType="text"
         />
 
-        <AdminSettingInput
+        <StarRezSecretSettingInput
           name="starrez-api-token"
           title={t`REST Token`}
-          description={t`Used as the password for HTTP Basic Auth (stored encrypted)`}
+          description={t`Used as the password for HTTP Basic Auth. The saved token is never returned to the browser.`}
           placeholder={t`Paste your StarRez REST token`}
-          inputType="password"
+          configured={status?.configured.api_token}
+          onSaved={onStatusChanged}
         />
 
-        <AdminSettingInput
+        <StarRezSecretSettingInput
           name="starrez-blob-sas-url"
           title={t`Azure Blob Storage SAS URL`}
-          description={t`Container-level SAS URL with read, write, delete, and list permissions`}
+          description={t`Container-level SAS URL with read, write, delete, and list permissions. The saved URL is never returned to the browser.`}
           placeholder="https://myaccount.blob.core.windows.net/mycontainer?sv=...&sig=..."
-          inputType="password"
+          configured={status?.configured.blob_sas_url}
+          onSaved={onStatusChanged}
         />
 
         <AdminSettingInput
@@ -800,7 +875,13 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function PostgresConfigSection() {
+function PostgresConfigSection({
+  status,
+  onStatusChanged,
+}: {
+  status?: StarRezStatus;
+  onStatusChanged: () => Promise<unknown> | unknown;
+}) {
   const [testDb, { isLoading: testing, data: testResult }] =
     useTestStarRezDbMutation();
 
@@ -834,12 +915,13 @@ function PostgresConfigSection() {
           inputType="text"
         />
 
-        <AdminSettingInput
+        <StarRezSecretSettingInput
           name="starrez-pg-password"
           title={t`Password`}
-          description={t`Stored encrypted`}
+          description={t`The saved password is never returned to the browser.`}
           placeholder={t`Postgres password`}
-          inputType="password"
+          configured={status?.configured.pg_password}
+          onSaved={onStatusChanged}
         />
 
         <AdminSettingInput
@@ -1008,7 +1090,7 @@ export function StarRezSettingsPage() {
         </Alert>
       )}
 
-      <ConfigSection />
+      <ConfigSection status={status} onStatusChanged={refetchStatus} />
       <ReportAutoRefreshSection
         status={status}
         onStatusChanged={refetchStatus}
@@ -1017,7 +1099,7 @@ export function StarRezSettingsPage() {
         status={status}
         onRefresh={refetchStatus}
       />
-      <PostgresConfigSection />
+      <PostgresConfigSection status={status} onStatusChanged={refetchStatus} />
       <ExportSection />
       <SnapshotsSection />
       <PastExportsSection />

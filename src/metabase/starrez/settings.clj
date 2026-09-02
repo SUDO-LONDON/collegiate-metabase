@@ -23,6 +23,8 @@
 (defsetting starrez-api-token
   (deferred-tru "StarRez REST token (used as the password for HTTP Basic Auth)")
   :encryption :when-encryption-key-set
+  :export?    false
+  :sensitive? true
   :visibility :admin
   :type       :string
   :audit      :no-value)
@@ -30,6 +32,8 @@
 (defsetting starrez-blob-sas-url
   (deferred-tru "Azure Blob Storage container-level SAS URL for StarRez exports")
   :encryption :when-encryption-key-set
+  :export?    false
+  :sensitive? true
   :visibility :admin
   :type       :string
   :audit      :no-value)
@@ -99,6 +103,8 @@
 (defsetting starrez-pg-password
   (deferred-tru "Password for the StarRez Postgres user (stored encrypted)")
   :encryption :when-encryption-key-set
+  :export?    false
+  :sensitive? true
   :visibility :admin
   :type       :string
   :audit      :no-value)
