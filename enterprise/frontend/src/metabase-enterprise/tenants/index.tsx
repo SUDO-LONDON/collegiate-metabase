@@ -16,7 +16,7 @@ import {
   type CollectionTreeItem,
   buildCollectionTree,
   getCollectionIcon,
-} from "metabase/collections/utils";
+} from "metabase/common/collections/utils";
 import { useSetting } from "metabase/common/hooks/use-setting";
 import { ModalRoute } from "metabase/hoc/ModalRoute";
 import {
@@ -73,10 +73,12 @@ export function initializePlugin() {
   if (hasPremiumFeature("tenants")) {
     PLUGIN_TENANTS.isEnabled = true;
 
-    PLUGIN_TENANTS.useListActiveTenants = () => {
-      const { data, isLoading, error } = useListTenantsQuery({
-        status: "active",
-      });
+    PLUGIN_TENANTS.useListActiveTenants = ({ skip } = {}) => {
+      const { data, isLoading, error } = useListTenantsQuery(
+        { status: "active" },
+        { skip },
+      );
+
       return { data: data?.data, isLoading, error };
     };
 

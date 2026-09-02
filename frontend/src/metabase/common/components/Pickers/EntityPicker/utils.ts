@@ -52,7 +52,7 @@ export const useGetEntityPickerIcon = () => {
         icon.name = "clock";
       }
 
-      return { ...icon, color: undefined, c: icon.color ?? "brand" };
+      return { ...icon, color: undefined, c: icon.color ?? "core-brand" };
     },
     [getIcon],
   );
@@ -242,7 +242,6 @@ export const getCollectionItemsOptions = ({
 }) => {
   return {
     models: getValidCollectionItemModels(models),
-    include_can_run_adhoc_query: models.includes("table"),
   };
 };
 

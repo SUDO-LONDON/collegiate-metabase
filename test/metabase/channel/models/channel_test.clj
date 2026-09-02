@@ -1,6 +1,7 @@
 (ns metabase.channel.models.channel-test
   (:require
    [clojure.test :refer :all]
+   [metabase.app-db.core :as mdb]
    [metabase.channel.models.channel] ;; ensure known-labels are loaded
    [metabase.notification.test-util :as notification.tu]
    [metabase.test :as mt]
@@ -9,10 +10,13 @@
    [toucan2.core :as t2]))
 
 (deftest channel-details-is-encrypted
-  (encryption-test/with-secret-key "secret"
-    (mt/with-model-cleanup [:model/Channel]
-      (let [channel (t2/insert-returning-instance! :model/Channel notification.tu/default-can-connect-channel)]
-        (is (encryption/possibly-encrypted-string? (t2/select-one-fn :details :channel (:id channel))))))))
+  ;; isolated app DB: runs with an encryption key active, so nothing here may touch the shared test DB
+  (mt/with-temp-empty-app-db [_conn :h2]
+    (mdb/setup-db! :create-sample-content? false)
+    (encryption-test/with-secret-key "secret"
+      (mt/with-model-cleanup [:model/Channel]
+        (let [channel (t2/insert-returning-instance! :model/Channel notification.tu/default-can-connect-channel)]
+          (is (encryption/possibly-encrypted-string? (t2/select-one-fn :details :channel (:id channel)))))))))
 
 (deftest deactivate-channel-test
   (mt/with-temp
@@ -55,7 +59,7 @@
         (testing "success"
           (is (some? (insert! {:details {:type    "email/handlebars-resource"
                                          :subject "Hello {{name}}"
-                                         :path    "metabase/channel/email/password_reset.hbs"}}))))
+                                         :path    "password_reset"}}))))
         (testing "invalid path"
           (is (thrown? Exception
                        (insert! {:details {:type    "email/handlebars-resource"
@@ -95,7 +99,7 @@
                                     {:channel-type :channel/email})))))))
 
 (deftest channel-template-create-logging-test
-  (testing "creating a user-provided template logs the template body"
+  (testing "creating a user-provided template logs template metadata, without leaking the template body"
     (mt/with-log-messages-for-level [messages :info]
       (mt/with-model-cleanup [:model/ChannelTemplate]
         (t2/insert-returning-instance! :model/ChannelTemplate
@@ -106,6 +110,9 @@
                                                        :body    "Secret {{password}}"}})
         (is (some (fn [{:keys [message]}]
                     (and (re-find #"ChannelTemplate create" message)
-                         (re-find #"handlebars-text" message)
-                         (re-find #"Secret" message)))
-                  (messages)))))))
+                         (re-find #"handlebars-text" message)))
+                  (messages)))
+        (testing "the template body itself is not logged"
+          (is (not (some (fn [{:keys [message]}]
+                           (re-find #"Secret" message))
+                         (messages)))))))))

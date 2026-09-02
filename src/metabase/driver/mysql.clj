@@ -20,7 +20,7 @@
    [metabase.driver.sql-jdbc.common :as sql-jdbc.common]
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
-   [metabase.driver.sql-jdbc.quoting :refer [quote-columns]]
+   [metabase.driver.sql-jdbc.quoting :as quoting :refer [quote-columns]]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.sql.query-processor.like-escape-char-built-in :as like-escape-char-built-in]
@@ -52,6 +52,13 @@
 
 (driver/register! :mysql, :parent #{:sql-jdbc ::like-escape-char-built-in/like-escape-char-built-in})
 
+(defmethod driver/host-carrying-parameters :mysql [_driver] [])
+
+(defmethod driver/non-host-parameters :mysql
+  [_driver]
+  ["disableSslHostnameVerification" "localSocketAddress" "serverRsaPublicKeyFile" "serverSslCert" "serverTimezone"
+   "tcpNoDelay" "trustServerCertificate" "useServerPrepStmts"])
+
 (def ^:private ^:const min-supported-mysql-version 5.7)
 (def ^:private ^:const min-supported-mariadb-version 10.2)
 
@@ -64,7 +71,6 @@
                               :connection-impersonation               true
                               :connection-impersonation-requires-role true
                               :describe-fields                        true
-                              :describe-fks                           true
                               :convert-timezone                       true
                               :datetime-diff                          true
                               :full-join                              false
@@ -122,13 +128,6 @@
   [_driver database]
   (:db (:details database)))
 
-;; This is a bit of a lie since the JSON type was introduced for MySQL since 5.7.8.
-;; And MariaDB doesn't have the JSON type at all, though `JSON` was introduced as an alias for LONGTEXT in 10.2.7.
-;; But since JSON unfolding will only apply columns with JSON types, this won't cause any problems during sync.
-(defmethod driver/database-supports? [:mysql :nested-field-columns]
-  [_driver _feat db]
-  (driver.common/json-unfolding-default db))
-
 (doseq [feature [:actions :actions/custom :actions/data-editing]]
   (defmethod driver/database-supports? [:mysql feature]
     [driver _feat _db]
@@ -166,6 +165,11 @@
   "Returns true if the database is MariaDB."
   [conn :- (lib.schema.common/instance-of-class Connection)]
   (= (connection-flavor conn) "MariaDB"))
+
+;; MariaDB doesn't have the JSON type at all, though `JSON` was introduced as an alias for LONGTEXT in 10.2.7.
+(defmethod driver/database-supports? [:mysql :nested-field-columns]
+  [_driver _feat db]
+  (and (driver.common/json-unfolding-default db) (not (mariadb? db))))
 
 (defmethod driver/database-supports? [:mysql :table-privileges]
   [_driver _feat _db]
@@ -350,10 +354,16 @@
   :sunday)
 
 (defmethod driver/rename-tables!* :mysql
-  [_driver db-id sorted-rename-map]
-  (let [rename-clauses (map (fn [[from-table to-table]]
-                              (str (sql/format-entity from-table) " TO " (sql/format-entity to-table)))
-                            sorted-rename-map)
+  [driver db-id sorted-rename-map]
+  ;; `with-quoting` is what binds the dialect: a bare `sql/format-entity` leaves it nil, and
+  ;; then HoneySQL's quote fn is `identity` and every identifier goes out raw
+  (let [rename-clauses (quoting/with-quoting driver
+                         (doall
+                          (map (fn [[from-table to-table]]
+                                 (str (sql/format-entity from-table)
+                                      " TO "
+                                      (sql/format-entity to-table)))
+                               sorted-rename-map)))
         sql (str "RENAME TABLE " (str/join ", " rename-clauses))]
     (sql-jdbc.execute/do-with-connection-with-options
      :mysql
@@ -495,7 +505,14 @@
         ;; equivalent; instead you can do `<string> + 0.0` =(
         ("float" "double") [:+ json-extract+jsonpath [:inline 0.0]]
 
-        [:convert json-extract+jsonpath [:raw (u/upper-case-en field-type)]]))))
+        ;; CONVERT's target type cannot be a quoted identifier, so a `database-type` that isn't a plain type name
+        ;; (the same rule as [[h2x/cast]]) cannot be spliced into the SQL safely — reject it instead
+        (do
+          (when-not (h2x/raw-type-name? field-type)
+            (throw (ex-info (format "Invalid database type for MySQL CONVERT: %s" (pr-str field-type))
+                            {:type          driver-api/qp.error-type.invalid-query
+                             :database-type field-type})))
+          [:convert json-extract+jsonpath [:raw (u/upper-case-en field-type)]])))))
 
 (defmethod sql.qp/->honeysql [:mysql :field]
   [driver [_ id-or-name opts :as mbql-clause]]
@@ -534,14 +551,14 @@
 
 (defmethod sql.qp/date [:mysql :minute]
   [_driver _unit expr]
-  (let [format-str (if (= (h2x/database-type expr) "time")
+  (let [format-str (if (h2x/database-or-effective-type-isa? expr "time" :type/Time)
                      "%H:%i"
                      "%Y-%m-%d %H:%i")]
     (trunc-with-format format-str expr)))
 
 (defmethod sql.qp/date [:mysql :hour]
   [_driver _unit expr]
-  (let [format-str (if (= (h2x/database-type expr) "time")
+  (let [format-str (if (h2x/database-or-effective-type-isa? expr "time" :type/Time)
                      "%H"
                      "%Y-%m-%d %H")]
     (trunc-with-format format-str expr)))
@@ -560,9 +577,9 @@
 
 (defn- temporal-cast [type expr]
   ;; mysql does not allow casting to timestamp
-  (if (= "timestamp" (u/lower-case-en type))
-    (h2x/maybe-cast "datetime" expr)
-    (h2x/maybe-cast type expr)))
+  (if (= "date" (u/lower-case-en type))
+    (h2x/maybe-cast "date" expr)
+    (h2x/maybe-cast "datetime" expr)))
 
 (defmethod sql.qp/date [:mysql :day]
   [_ _ expr]
@@ -614,7 +631,9 @@
                        (h2x/is-of-type? expr "timestamp"))]
     (sql.u/validate-convert-timezone-args timestamp? target-timezone source-timezone)
     (h2x/with-database-type-info
-     [:convert_tz expr (or source-timezone (driver-api/results-timezone-id)) target-timezone]
+     [:convert_tz expr
+      (sql.qp/->honeysql driver (or source-timezone (driver-api/results-timezone-id)))
+      (sql.qp/->honeysql driver target-timezone)]
      "datetime")))
 
 (defn- timestampdiff-dates [unit x y]
@@ -696,7 +715,17 @@
    ;; removing that overhead. See also
    ;; https://dev.mysql.com/doc/connector-j/en/connector-j-connp-props-performance-extensions.html#cj-conn-prop_useLocalSessionState
    ;; and #44507
-   :useLocalSessionState true})
+   :useLocalSessionState true
+   ;; A `nil` catalog passed to `DatabaseMetaData.getTables` must mean "the current (bound) database",
+   ;; NOT "every database the user has privileges on". `active-tables` (and `describe-database` generally)
+   ;; relies on this: it passes `nil` for the catalog and trusts the driver to scope results to the
+   ;; connected DB. This is the MariaDB 2.x default, but pin it explicitly so that (a) the contract is
+   ;; documented where the next person bumping the driver will see it, and (b) a future driver upgrade
+   ;; can't silently flip the default to `false` and widen sync to sibling databases — Connector/J 8.x,
+   ;; for instance, defaults this to `false`. Pinning `true` is also why we must pass `nil` rather than
+   ;; `(.getCatalog conn)`: on Vitess/PlanetScale replica connections getCatalog returns the routing-
+   ;; qualified `<db>@replica`, which never matches the bare `TABLE_SCHEMA`. See #75929.
+   :nullCatalogMeansCurrent true})
 
 (defn- maybe-add-program-name-option [jdbc-spec additional-options-map]
   ;; connectionAttributes (if multiple) are separated by commas, so values that contain spaces are OK, so long as they
@@ -752,18 +781,22 @@
            (sql-jdbc.common/handle-additional-options details))))))
 
 (defmethod sql-jdbc.sync/active-tables :mysql
-  [driver ^java.sql.Connection conn schema-inclusion-filters schema-exclusion-filters]
-  ;; Scope describe-database to the connection's current catalog (= bound DB).
-  ;; By default `post-filtered-active-tables` passes `nil` for the catalog filter,
-  ;; which makes JDBC enumerate every DB the user has privileges on. That's wrong
-  ;; for workspace MySQL users — they own the iso DB and have GRANT SELECT on the
-  ;; canonical DB, so the iso DB's tables would leak into sync. Constraining to
-  ;; `conn.getCatalog()` means only the canonical (bound) DB's tables show up,
-  ;; regardless of what else the user can read. Also strictly more correct for
-  ;; plain MySQL: a user with GRANT on multiple DBs only configured one as the
-  ;; Metabase Database; sync should never have surfaced the others.
-  (sql-jdbc.sync/post-filtered-active-tables
-   driver conn (.getCatalog conn) schema-inclusion-filters schema-exclusion-filters))
+  [& args]
+  ;; Pass `nil` for the catalog filter (the default). Our MySQL/MariaDB JDBC driver defaults to
+  ;; `nullCatalogMeansCurrent=true`, so a `nil` catalog already scopes `getTables()` to the connection's
+  ;; current (bound) database — it does NOT enumerate every DB the user can read.
+  ;;
+  ;; Do NOT pass `(.getCatalog conn)` here. On PlanetScale/Vitess connections made with *replica*
+  ;; credentials (or any `<db>@replica`-targeted connection), `SELECT DATABASE()` — which backs
+  ;; `getCatalog()` — returns the routing-qualified name `<db>@replica`. The driver compiles a non-nil
+  ;; catalog into `WHERE TABLE_SCHEMA = '<db>@replica'`, but `information_schema` stores the bare
+  ;; `TABLE_SCHEMA = '<db>'`, so the filter matches nothing and sync sees an empty database. The `@replica`
+  ;; suffix is a Vitess routing directive, not part of the schema name, so it can never equal a real
+  ;; `TABLE_SCHEMA`. See #75929. (Verified against live PlanetScale: nil → 3 tables, getCatalog → 0.)
+  ;;
+  ;; (If no database is bound, current-DB scoping resolves to nothing and `getTables` returns zero tables;
+  ;; this fails safe and is unreachable in practice since a MySQL Database always has `:dbname`.)
+  (apply sql-jdbc.sync/post-filtered-active-tables args))
 
 (defmethod sql-jdbc.sync/excluded-schemas :mysql
   [_]
@@ -1107,8 +1140,9 @@
     #"^GRANT (.+) TO "
     :>>
     (fn [[_ roles]]
+      ;; role names are case-sensitive to MySQL, so they must be passed back to `SHOW GRANTS ... USING` verbatim
       {:type  :roles
-       :roles (set (map u/lower-case-en (str/split roles #",")))})))
+       :roles (set (str/split roles #","))})))
 
 (defn- privilege-grants-for-user
   "Returns a list of parsed privilege grants for a user, taking into account the roles that the user has.
@@ -1124,7 +1158,7 @@
          privilege-grants :privileges} (group-by :type grants)]
     (if (seq role-grants)
       (let [roles  (:roles (first role-grants))
-            grants (map parse-grant (query (str "SHOW GRANTS FOR " user "USING " (str/join "," roles))))
+            grants (map parse-grant (query (str "SHOW GRANTS FOR " user " USING " (str/join "," roles))))
             {privilege-grants :privileges} (group-by :type grants)]
         privilege-grants)
       privilege-grants)))
@@ -1318,8 +1352,14 @@
           (doseq [sql [;; Create the isolated database
                        (format "CREATE DATABASE IF NOT EXISTS %s" quoted-db)
                        user-sql
-                       ;; Grant all privileges on the isolated database
-                       (format "GRANT ALL PRIVILEGES ON %s.* TO %s@'%%'" quoted-db quoted-user)]]
+                       ;; Least-privilege grant on the workspace's own DB (vs. ALL PRIVILEGES,
+                       ;; dropping GRANT OPTION, CREATE VIEW/ROUTINE, TRIGGER, etc.):
+                       ;;   SELECT, INSERT, UPDATE, DELETE - full DML on its own tables
+                       ;;   CREATE - transform target / CTAS
+                       ;;   DROP   - swap/cleanup
+                       ;;   ALTER  - required (with DROP/CREATE) for RENAME TABLE swaps
+                       (format "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER ON %s.* TO %s@'%%'"
+                               quoted-db quoted-user)]]
             (.addBatch ^Statement stmt ^String sql))
           (try
             (.executeBatch ^Statement stmt)

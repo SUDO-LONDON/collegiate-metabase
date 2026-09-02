@@ -127,6 +127,14 @@
           (is (= #{"dbone_a" "dbone_b" "dbone_c"}
                  (into #{} (map :name) (driver/describe-fields :mysql database)))))))))
 
+(deftest ^:parallel hour-bucketing-time-without-database-type-test
+  (testing (str "Hour bucketing on a TIME-typed expression without `:database-type` (as happens for "
+                "fields referenced by name from a source query, #75193) should use the TIME-only format "
+                "string and not produce a DATETIME-with-date format")
+    (let [expr (h2x/with-type-info :test_col {:effective-type :type/Time})]
+      (is (= ["STR_TO_DATE(DATE_FORMAT(CAST(`test_col` AS datetime), '%H'), '%H')"]
+             (sql.qp/format-honeysql :mysql (sql.qp/date :mysql :hour expr)))))))
+
 (deftest date-test
   ;; make sure stuff at least compiles. Even if the result probably isn't as concise as it could be.
   ;; See [[metabase.query-processor.date-time-zone-functions-test/extract-week-tests]] for something that tests
@@ -147,10 +155,7 @@
                                         "    ("
                                         "      ("
                                         "        DAYOFYEAR(weeks.d) - ("
-                                        "          8 - COALESCE("
-                                        "            NULLIF((DAYOFWEEK(MAKEDATE(YEAR(weeks.d), 1)) + 5) % 7, 0),"
-                                        "            7"
-                                        "          )"
+                                        "          8 - (((DAYOFWEEK(MAKEDATE(YEAR(weeks.d), 1)) + 4) % 7) + 1)"
                                         "        )"
                                         "      ) / 7.0"
                                         "    )"
@@ -542,7 +547,12 @@
     (testing "Doesn't complain when field is boolean"
       (let [boolean-boop-field {:database-type "boolean" :nfc-path [:bleh "boop" :foobar 1234]}]
         (is (= ["JSON_UNQUOTE(JSON_EXTRACT(`boop`.`bleh`, ?))" "$.\"boop\".\"foobar\".\"1234\""]
-               (sql.qp/format-honeysql :mysql (sql.qp/json-query :mysql boop-identifier boolean-boop-field))))))))
+               (sql.qp/format-honeysql :mysql (sql.qp/json-query :mysql boop-identifier boolean-boop-field))))))
+    (testing "a database-type that isn't a plain type name is rejected instead of spliced raw into CONVERT"
+      (let [evil-field {:database-type "signed); select 1 --" :nfc-path [:bleh :meh]}]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"Invalid database type for MySQL CONVERT"
+                              (sql.qp/json-query :mysql boop-identifier evil-field)))))))
 
 (tx/defdataset json-unquote-test
   [["json_test"
@@ -832,6 +842,10 @@
     (is (= {:type  :roles
             :roles #{"`example_role`@`%`" "`example_role_2`@`%`"}}
            (#'mysql/parse-grant "GRANT `example_role`@`%`,`example_role_2`@`%` TO 'metabase'@'localhost'")))
+    (testing "role names keep their case (GHY-3835): MySQL 8 backticked role identifiers are case-sensitive, so lowercasing them makes the follow-up `SHOW GRANTS ... USING` fail with error 3530"
+      (is (= {:type  :roles
+              :roles #{"`AWS_FOO_ROLE`@`%`"}}
+             (#'mysql/parse-grant "GRANT `AWS_FOO_ROLE`@`%` TO `mb_case_test`@`%`"))))
     (is (nil? (#'mysql/parse-grant "GRANT PROXY ON 'metabase'@'localhost' TO 'metabase'@'localhost' WITH GRANT OPTION")))
     (testing "REVOKE grants (emitted under partial_revokes) are ignored rather than throwing"
       (is (nil? (#'mysql/parse-grant "REVOKE INSERT ON `test-data`.`foo` FROM 'metabase'@'localhost'")))
@@ -1090,3 +1104,35 @@
               "query should throw rather than completing normally")
           (is (< elapsed 30000)
               (format "query should be cancelled well before SLEEP(60) completes naturally — took %.0f ms" elapsed)))))))
+
+(deftest ^:parallel add-interval-honeysql-form-rejects-hostile-unit-test
+  (testing "the MySQL interval sink refuses a unit outside its closed allow-list"
+    (let [hostile (keyword "day) FROM t2 UNION SELECT pw FROM secrets --")]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"Invalid temporal unit"
+           (sql.qp/add-interval-honeysql-form :mysql :some_col 1 hostile))))
+    (testing "and refuses a non-numeric amount, which would otherwise be spliced into raw SQL"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"Invalid interval amount"
+           (sql.qp/add-interval-honeysql-form :mysql :some_col "1 DAY) UNION SELECT pw FROM secrets --" :day))))
+    (testing "and still compiles a legitimate (possibly fractional) amount to the expected INTERVAL token"
+      (is (= ["INTERVAL 1 day"]
+             (sql/format-expr (last (sql.qp/add-interval-honeysql-form :mysql :some_col 1 :day)))))
+      (is (= ["INTERVAL 0.5 second"]
+             (sql/format-expr (last (sql.qp/add-interval-honeysql-form :mysql :some_col 0.5 :second))))))))
+
+(deftest ^:parallel date-bucketing-never-splices-database-type-test
+  (testing "MySQL date bucketing never splices a client-supplied database_type into the CAST target"
+    (let [hostile "datetime) UNION SELECT pw FROM secrets --"
+          sql     (first (sql/format {:select [[(sql.qp/date :mysql :day (h2x/with-database-type-info :some_col hostile))]]}
+                                     {:dialect :mysql :quoted true}))]
+      (is (not (str/includes? (u/lower-case-en sql) "union"))
+          "the hostile database_type does not reach the emitted SQL at all")
+      (is (= "SELECT CAST(DATE(`some_col`) AS datetime)" sql)
+          "the client type only selects a safe temporal target; it is never emitted"))
+    (testing "a legitimate temporal type still compiles to the expected CAST keyword"
+      (is (= ["SELECT CAST(DATE(`some_col`) AS datetime)"]
+             (sql/format {:select [[(sql.qp/date :mysql :day (h2x/with-database-type-info :some_col "datetime"))]]}
+                         {:dialect :mysql :quoted true}))))))

@@ -93,9 +93,26 @@ describe("scenarios > home > homepage", () => {
         triggered_from: "suggestion_sidebar",
       });
 
-      cy.intercept("POST", "/api/dashboard/save").as("saveDashboard");
+      // Wait for the final x-ray dashboard to actually be ready before saving.
+      // `@getXrayDashboard` only confirms the automagic metadata GET; the dashboard isn't in
+      // the store yet. Once it is, `useDashboardUrlQuery`
+      // (frontend/src/metabase/dashboard/hooks/use-dashboard-url-query.ts) syncs the
+      // dashboard's parameters into the URL (dispatch(replace(...))), so the query string
+      // becomes populated. That is a reliable "dashboard is ready" signal; clicking
+      // "Save this" before it means the dashboard isn't ready and the save is lost.
+      cy.location("search").should("not.be.empty");
+
       cy.findByTestId("automatic-dashboard-header").button("Save this").click();
-      cy.wait("@saveDashboard");
+
+      // Assert the save succeeded via the resulting UI — the header switches to a "Saved"
+      // button + "See it" link — rather than waiting on the POST /api/dashboard/save
+      // request. The request-alias wait was timing-sensitive and flaked with "No request
+      // ever occurred"; the saved-state UI is the real user-observable outcome and Cypress
+      // retries it until the save completes.
+      cy.findByTestId("automatic-dashboard-header").within(() => {
+        cy.findByText("See it").should("be.visible");
+        cy.findByText("Saved").should("be.visible");
+      });
 
       H.expectUnstructuredSnowplowEvent({
         event: "x-ray_saved",
@@ -170,18 +187,16 @@ describe("scenarios > home > homepage", () => {
       cy.visit("/");
       // eslint-disable-next-line metabase/no-unscoped-text-selectors -- deprecated usage
       cy.findByText(/Here are some explorations of the/);
-      // eslint-disable-next-line metabase/no-unscoped-text-selectors -- deprecated usage
-      cy.findByText("public");
+      cy.findByTestId("xray-schema-name").should("have.text", "public");
       cy.findAllByRole("link").contains("sqlite");
       // eslint-disable-next-line metabase/no-unscoped-text-selectors -- deprecated usage
       cy.findByText("Orders");
       // eslint-disable-next-line metabase/no-unscoped-text-selectors -- deprecated usage
       cy.findByText("People").should("not.exist");
 
-      // eslint-disable-next-line metabase/no-unscoped-text-selectors -- deprecated usage
-      cy.findByText("public").click();
-      // eslint-disable-next-line metabase/no-unscoped-text-selectors -- deprecated usage
-      cy.findByText("private").click();
+      cy.findByTestId("xray-schema-name").click();
+      cy.findByRole("option", { name: "private" }).click();
+      cy.findByTestId("xray-schema-name").should("have.text", "private");
       // eslint-disable-next-line metabase/no-unscoped-text-selectors -- deprecated usage
       cy.findByText("People");
       // eslint-disable-next-line metabase/no-unscoped-text-selectors -- deprecated usage
@@ -343,6 +358,7 @@ describe("scenarios > home > custom homepage", () => {
         cy.findByRole("radio", { name: "Dashboard" }).click();
       });
       cy.wait("@putSettings");
+      H.undoToast().icon("close").click();
 
       cy.findByTestId("custom-homepage-dashboard-setting")
         .findByRole("button")
@@ -352,6 +368,7 @@ describe("scenarios > home > custom homepage", () => {
       H.entityPickerModal().findByText("Orders in a dashboard").click();
 
       H.undoToast().findByText("Changes saved").should("be.visible");
+      H.undoToast().icon("close").click();
 
       cy.findByTestId("custom-homepage-dashboard-setting").should(
         "contain",
@@ -641,6 +658,7 @@ describe("scenarios > setup", () => {
       .findByRole("radio", { name: "Dashboard" })
       .click();
     cy.wait("@putSettings");
+    H.undoToast().icon("close").click();
 
     cy.findByTestId("custom-homepage-dashboard-setting")
       .findByRole("button")

@@ -1,12 +1,36 @@
 import json
+import logging
 import re
 
 import sqlglot
+
+# sqlglot's parser warnings quote raw chunks of the SQL being parsed ("... contains unsupported
+# syntax. Falling back to parsing as a 'Command'."); silence them so customer SQL never reaches
+# stderr/server logs.
+logging.getLogger("sqlglot").setLevel(logging.CRITICAL)
 import sqlglot.lineage as lineage
 import sqlglot.optimizer as optimizer
 import sqlglot.optimizer.qualify as qualify
 from sqlglot import exp
+from sqlglot.dialects.clickhouse import ClickHouse
 from sqlglot.errors import OptimizeError, ParseError
+
+# sqlglot (as of 28.6.0) renders every placeholder in ClickHouse's named-parameter
+# syntax `{name: Type}`, so a positional JDBC placeholder `?` (a nameless Placeholder)
+# round-trips to `{?: }`, which ClickHouse rejects with "Expected substitution name"
+# (Code 62). Compiled queries we rewrite can carry prepared-statement params — e.g.
+# workspace table remapping of an incremental transform's checkpoint filter — so keep
+# positional placeholders as `?`; named query parameters still take the upstream path.
+_clickhouse_placeholder_sql = ClickHouse.Generator.placeholder_sql
+
+
+def _placeholder_sql_keep_positional(self, expression: exp.Placeholder) -> str:
+    if not expression.this:
+        return "?"
+    return _clickhouse_placeholder_sql(self, expression)
+
+
+ClickHouse.Generator.placeholder_sql = _placeholder_sql_keep_positional
 
 
 def is_quoted_identifier(name: str, dialect: str = None) -> bool:
@@ -1634,13 +1658,15 @@ def is_single_stmt_of_type(sql: str, stmt_type: str = "read", dialect: str = Non
     """Validates that a query is a single read statement (SELECT) or a single write statement (INSERT, UPDATE, DELETE)
     and returns the query reconstructed from the parsed AST.
     """
-    result = {"is_single_stmt?": False}
+    result = {"is_single_stmt?": False, "allowed_stmt_type?": False}
     try:
         stmts = sqlglot.parse(sql, read=dialect)
         allowed_types = (exp.Select, exp.SetOperation)
         if stmt_type != "read": allowed_types = (exp.Update, exp.Insert, exp.Delete)
-        if len(stmts) == 1 and isinstance(stmts[0], allowed_types):
+        if len(stmts) == 1:
             result["is_single_stmt?"] = True
+            if isinstance(stmts[0], allowed_types):
+                result["allowed_stmt_type?"] = True
             result["sql"] = stmts[0].sql(dialect=dialect) if dialect else stmts[0].sql()
     except Exception as e:
         result["error"] = str(e)

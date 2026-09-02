@@ -8,7 +8,8 @@
    [metabase.search.config :as search.config]
    [metabase.search.in-place.filter :as search.filter]
    [metabase.search.permissions :as search.permissions]
-   [metabase.test :as mt]))
+   [metabase.test :as mt]
+   [metabase.util.honey-sql-2 :as h2x]))
 
 (def default-search-ctx
   {:search-string                  nil
@@ -20,6 +21,8 @@
    :is-data-analyst?               false
    :current-user-perms             #{"/"}
    :calculate-available-models?    false
+   :is-sandboxed-user?             false
+   :is-impersonated-user?          false
    :enabled-transform-source-types #{"mbql"}})
 
 (deftest ^:parallel ->applicable-models-test
@@ -121,6 +124,30 @@
                      {:is-superuser? false
                       :models #{"dashboard" "card" "transform"}})))))))
 
+(deftest ^:parallel app-user-visibility-test
+  (testing "models with :visibility :app-user (indexed-entity) are hidden from sandboxed/impersonated users"
+    (let [models #{"dashboard" "card" "indexed-entity"}]
+      (testing "an ordinary user still sees indexed-entity"
+        (is (contains?
+             (search.filter/search-context->applicable-models
+              (merge default-search-ctx {:models models
+                                         :is-sandboxed-user? false
+                                         :is-impersonated-user? false}))
+             "indexed-entity")))
+      (testing "an impersonated user does not -- even with no search string (the LIKE-clause guard never fires)"
+        (is (= #{"dashboard" "card"}
+               (search.filter/search-context->applicable-models
+                (merge default-search-ctx {:models models
+                                           :search-string nil
+                                           :is-sandboxed-user? false
+                                           :is-impersonated-user? true})))))
+      (testing "a sandboxed user does not either"
+        (is (= #{"dashboard" "card"}
+               (search.filter/search-context->applicable-models
+                (merge default-search-ctx {:models models
+                                           :is-sandboxed-user? true
+                                           :is-impersonated-user? false}))))))))
+
 (deftest joined-with-table?-test
   #_{:clj-kondo/ignore [:equals-true]}
   (are [expected args]
@@ -172,10 +199,10 @@
   (testing "with search string"
     (is (= [:and
             [:or
-             [:like [:lower :card.name] "%a%"]
-             [:like [:lower :card.name] "%string%"]
-             [:like [:lower :card.description] "%a%"]
-             [:like [:lower :card.description] "%string%"]]
+             [:like [:lower :card.name] (h2x/like-substring "a")]
+             [:like [:lower :card.name] (h2x/like-substring "string")]
+             [:like [:lower :card.description] (h2x/like-substring "a")]
+             [:like [:lower :card.description] (h2x/like-substring "string")]]
             [:= :card.archived false]]
            (:where (search.filter/build-filters
                     base-search-query "card"
@@ -357,7 +384,7 @@
                 base-search-query
                 {:where  [:and
                           [:= :card.archived false]
-                          [:inline [:= 0 1]]]})
+                          [:= [:inline 0] [:inline 1]]]})
                (search.filter/build-filters
                 base-search-query "card"
                 (merge default-search-ctx {:verified true}))))))))
@@ -370,7 +397,7 @@
                 base-search-query
                 {:where  [:and
                           [:= :card.archived false]
-                          [:inline [:= 0 1]]]})
+                          [:= [:inline 0] [:inline 1]]]})
                (search.filter/build-filters
                 base-search-query "dataset"
                 (merge default-search-ctx {:verified true}))))))))
@@ -390,8 +417,8 @@
   (testing "users that are not sandboxed or impersonated can search for indexed entity"
     (mt/with-dynamic-fn-redefs [search.permissions/sandboxed-or-impersonated-user? (constantly false)]
       (is (= [:and
-              [:or [:like [:lower :model-index-value.name] "%foo%"]]
-              [:inline [:= 1 1]]]
+              [:or [:like [:lower :model-index-value.name] (h2x/like-substring "foo")]]
+              [:= [:inline 1] [:inline 1]]]
              (:where (search.filter/build-filters
                       base-search-query
                       "indexed-entity"
@@ -402,7 +429,7 @@
     (mt/with-dynamic-fn-redefs [search.permissions/sandboxed-or-impersonated-user? (constantly true)]
       (is (= [:and
               [:or [:= 0 1]]
-              [:inline [:= 1 1]]]
+              [:= [:inline 1] [:inline 1]]]
              (:where (search.filter/build-filters
                       base-search-query
                       "indexed-entity"
@@ -413,7 +440,7 @@
     (testing model
       (testing "do not search for native query by default"
         (is (= [:and
-                [:or [:like [:lower :card.name] "%foo%"] [:like [:lower :card.description] "%foo%"]]
+                [:or [:like [:lower :card.name] (h2x/like-substring "foo")] [:like [:lower :card.description] (h2x/like-substring "foo")]]
                 [:= :card.archived false]]
                (:where (search.filter/build-filters
                         base-search-query
@@ -425,11 +452,11 @@
     (testing model
       (testing "search in both name, description and dataset_query if is enabled"
         (is (= [:and [:or
-                      [:like [:lower :card.name] "%foo%"]
-                      [:like [:lower :card.description] "%foo%"]
+                      [:like [:lower :card.name] (h2x/like-substring "foo")]
+                      [:like [:lower :card.description] (h2x/like-substring "foo")]
                       [:and
                        [:= :card.query_type "native"]
-                       [:like [:lower :card.dataset_query] "%foo%"]]]
+                       [:like [:lower :card.dataset_query] (h2x/like-substring "foo")]]]
                 [:= :card.archived false]]
                (:where (search.filter/build-filters
                         base-search-query
@@ -440,7 +467,7 @@
   (testing "action"
     (testing "do not search for native query by default"
       (is (= [:and
-              [:or [:like [:lower :action.name] "%foo%"] [:like [:lower :action.description] "%foo%"]]
+              [:or [:like [:lower :action.name] (h2x/like-substring "foo")] [:like [:lower :action.description] (h2x/like-substring "foo")]]
               [:= :action.archived false]]
              (:where (search.filter/build-filters
                       base-search-query
@@ -452,9 +479,9 @@
     (testing "search in both name, description and dataset_query if is enabled"
       (is (= [:and
               [:or
-               [:like [:lower :action.name] "%foo%"]
-               [:like [:lower :action.description] "%foo%"]
-               [:like [:lower :query_action.dataset_query] "%foo%"]]
+               [:like [:lower :action.name] (h2x/like-substring "foo")]
+               [:like [:lower :action.description] (h2x/like-substring "foo")]
+               [:like [:lower :query_action.dataset_query] (h2x/like-substring "foo")]]
               [:= :action.archived false]]
              (:where (search.filter/build-filters
                       base-search-query
@@ -468,5 +495,5 @@
         (let [result (search.filter/build-filters
                       base-search-query model
                       (merge default-search-ctx {:collection 1}))]
-          (is (some #{[:inline [:= 0 1]]}
+          (is (some #{[:= [:inline 0] [:inline 1]]}
                     (tree-seq sequential? seq (:where result)))))))))

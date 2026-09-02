@@ -47,6 +47,15 @@
 
 (driver/register! :sqlserver, :parent #{:sql-jdbc ::like-escape-char-built-in/like-escape-char-built-in})
 
+(defmethod driver/host-carrying-parameters :sqlserver
+  [_driver]
+  ["serverName" "failoverPartner" "enclaveAttestationUrl"])
+
+(defmethod driver/non-host-parameters :sqlserver
+  [_driver]
+  ["hostNameInCertificate" "iPAddressPreference" "instanceName" "integratedSecurity" "serverCertificate"
+   "serverNameAsACE" "serverPreparedStatementDiscardThreshold" "serverSpn" "trustServerCertificate"])
+
 (doseq [[feature supported?] {:case-sensitivity-string-filter-options false
                               :connection-impersonation               true
                               :connection-impersonation-requires-role true
@@ -207,6 +216,19 @@
       (merge (when port {:port port}))
       (sql-jdbc.common/handle-additional-options details, :seperator-style :semicolon)))
 
+(def ^:private disallowed-additional-opts
+  #"(?i)(?:socketFactoryClass|socketFactoryConstructorArg|trustManagerClass|trustManagerConstructorArg|accessTokenCallbackClass)")
+
+(defmethod driver/validate-db-details! :sqlserver
+  [_driver {:keys [host additional-options]}]
+  (when-let [match (some->> (str host ";" additional-options) (re-find disallowed-additional-opts))]
+    (throw (ex-info "Potentially dangerous keys in connection details" {:disallowed-key match}))))
+
+(defmethod driver/can-connect? :sqlserver
+  [driver details]
+  (driver/validate-db-details! driver details)
+  ((get-method driver/can-connect? :sql-jdbc) driver details))
+
 (def ^:private ^:dynamic *field-options*
   "The options part of the `:field` clause we're currently compiling."
   nil)
@@ -222,18 +244,30 @@
     [:inline x]
     x))
 
+(def ^:private allowed-dateparts
+  "Allow-list of the temporal units this driver emits as SQL Server `DATEPART`/`DATEADD` tokens. These are interpolated
+  through `[:raw …]`, so a unit reaching a sink here must be a member of this closed set before
+  `(name unit)` is emitted."
+  #{:year :quarter :month :dayofyear :day :week :iso_week :weekday
+    :hour :minute :second :millisecond :microsecond :nanosecond})
+
+(defn- datepart-token [unit]
+  (when-not (contains? allowed-dateparts unit)
+    (throw (ex-info (str "Invalid temporal unit: " (pr-str unit)) {:unit unit})))
+  (name unit))
+
 ;; See https://docs.microsoft.com/en-us/sql/t-sql/functions/datepart-transact-sql?view=sql-server-ver15
 (defn- date-part [unit expr]
-  (-> [:datepart [:raw (name unit)] expr]
+  (-> [:datepart [:raw (datepart-token unit)] expr]
       (h2x/with-database-type-info "integer")))
 
 (defn- date-add [unit & exprs]
-  (into [:dateadd [:raw (name unit)]]
+  (into [:dateadd [:raw (datepart-token unit)]]
         (map maybe-inline-number)
         exprs))
 
 (defn- date-diff [unit x y]
-  [:datediff_big [:raw (name unit)] x y])
+  [:datediff_big [:raw (datepart-token unit)] x y])
 
 ;; See https://docs.microsoft.com/en-us/sql/t-sql/functions/date-and-time-data-types-and-functions-transact-sql for
 ;; details on the functions we're using.
@@ -254,7 +288,7 @@
 
 (defmethod sql.qp/date [:sqlserver :minute]
   [_driver _unit expr]
-  (if (= (h2x/database-type expr) "time")
+  (if (h2x/database-or-effective-type-isa? expr "time" :type/Time)
     (time-from-parts (date-part :hour expr) (date-part :minute expr) 0 0 0)
     (h2x/maybe-cast :smalldatetime expr)))
 
@@ -282,7 +316,7 @@
 
 (defmethod sql.qp/date [:sqlserver :hour]
   [_driver _unit expr]
-  (if (= (h2x/database-type expr) "time")
+  (if (h2x/database-or-effective-type-isa? expr "time" :type/Time)
     (time-from-parts (date-part :hour expr) 0 0 0 0)
     (date-time-2-from-parts (h2x/year expr) (h2x/month expr) (h2x/day expr) (date-part :hour expr) 0 0 0 0)))
 
@@ -294,13 +328,12 @@
 ;; with something using the new system
 ;; Issue: https://github.com/metabase/metabase/issues/39386
 (defn- weekday
-  "Wrapper around (date-part :weekday ...) to account for potentially varying @@DATEFIRST"
+  "Wrapper around (date-part :weekday ...) to account for potentially varying @@DATEFIRST.
+  `((dow + @@DATEFIRST - 1) % 7) + 1` shifts the day-of-week into the range [1, 7] and propagates NULL."
   [expr]
-  [:coalesce
-   [:nullif
-    (h2x/mod (h2x/+ (date-part :weekday expr) [:raw "@@DATEFIRST"]) [:inline 7])
-    [:inline 0]]
-   [:inline 7]])
+  (h2x/+ (h2x/mod (h2x/- (h2x/+ (date-part :weekday expr) [:raw "@@DATEFIRST"]) [:inline 1])
+                  [:inline 7])
+         [:inline 1]))
 
 (defmethod sql.qp/date [:sqlserver :day]
   [_driver _unit expr]
@@ -519,6 +552,44 @@
 (defmethod sql.qp/datetime-diff [:sqlserver :minute] [_driver _unit x y] (date-diff :minute x y))
 (defmethod sql.qp/datetime-diff [:sqlserver :second] [_driver _unit x y] (date-diff :second x y))
 
+(defn- comparison-lhs-datetimeoffset?
+  "True when [[sql.qp/*parent-honeysql-col-type-info*]] indicates the LHS of the enclosing comparison is a
+  `datetimeoffset` column."
+  [parent-info]
+  (or (= "datetimeoffset" (:database-type parent-info))
+      (isa? (:effective-type parent-info) :type/DateTimeWithZoneOffset)
+      (isa? (:base-type parent-info) :type/DateTimeWithZoneOffset)))
+
+(defn- maybe-attach-report-timezone
+  "Wrap `rhs` in `AT TIME ZONE '<report-tz-windows-name>'` when:
+
+    - the LHS of the enclosing comparison is a `datetimeoffset` column,
+    - a report timezone is configured, and
+    - `rhs` is a naive `datetime`/`datetime2` (nothing to preserve).
+
+  Otherwise return `rhs` unchanged. This restores the report-timezone offset that date bucketing drops.
+  Without it, SQL Server implicitly treats a naive `datetime2` as offset +00:00 when comparing against
+  `datetimeoffset`, shifting the filter window by the report tz offset (#78612)."
+  [rhs]
+  (let [report-windows-tz (some-> (driver-api/requested-timezone-id) zone-id->windows-zone)
+        rhs-naive?        (contains? #{"datetime" "datetime2"}
+                                     (h2x/type-info->db-type (h2x/type-info rhs)))]
+    (cond-> rhs
+      (and report-windows-tz
+           rhs-naive?
+           (comparison-lhs-datetimeoffset? sql.qp/*parent-honeysql-col-type-info*))
+      (h2x/at-time-zone report-windows-tz))))
+
+(defmethod sql.qp/->honeysql [:sqlserver :relative-datetime]
+  [driver clause]
+  (maybe-attach-report-timezone
+   ((get-method sql.qp/->honeysql [:sql :relative-datetime]) driver clause)))
+
+(defmethod sql.qp/->honeysql [:sqlserver :absolute-datetime]
+  [driver clause]
+  (maybe-attach-report-timezone
+   ((get-method sql.qp/->honeysql [:sql :absolute-datetime]) driver clause)))
+
 (defmethod sql.qp/cast-temporal-string [:sqlserver :Coercion/ISO8601->DateTime]
   [_driver _semantic_type expr]
   (h2x/->datetime expr))
@@ -669,10 +740,12 @@
          (parent-method driver :filter honeysql-form))))
 
 ;; SQL Server doesn't like backslashes as the escape character for `LIKE` clauses. Use character classes instead to
-;; escape the `LIKE` metacharacters `%` and `_`.
+;; escape the `LIKE` metacharacters `[`, `%`, and `_`. `[` opens a character class, so it must be escaped first --
+;; the replacements below introduce `[` characters of their own that must not be re-escaped.
 (defmethod sql.qp/escape-like-pattern :sqlserver
   [_driver like-pattern]
   (-> like-pattern
+      (str/replace "["  "[[]")
       (str/replace "\\" "[\\]")
       (str/replace "%"  "[%]")
       (str/replace "_"  "[_]")))
@@ -949,7 +1022,7 @@
       (try
         (.setFetchDirection stmt ResultSet/FETCH_FORWARD)
         (catch Throwable e
-          (log/debug e "Error setting statement fetch direction to FETCH_FORWARD")))
+          (log/debugf "Error setting statement fetch direction to FETCH_FORWARD: %s" (ex-message e))))
       stmt
       (catch Throwable e
         (.close stmt)
@@ -1102,6 +1175,15 @@
         ^String table-name (first (sql.qp/format-honeysql driver (keyword output-table)))]
     [(format "INSERT INTO %s %s" table-name sql-query) sql-params]))
 
+(defmethod driver/run-transform! [:sqlserver :table-incremental]
+  [driver transform-details opts]
+  ;; SQL Server has no row-valued `IN (...)`, so the shared `:sql` merge can't express a composite-key
+  ;; delete the default way. Ask it to use a correlated `EXISTS` instead by threading `:delete-strategy`
+  ;; through `merge-opts`; only inject it when a merge is actually happening (leave append/create alone).
+  (let [opts (cond-> opts
+               (:merge opts) (assoc-in [:merge :delete-strategy] :exists))]
+    ((get-method driver/run-transform! [:sql :table-incremental]) driver transform-details opts)))
+
 (defmethod driver/table-exists? :sqlserver
   [driver database {:keys [schema name] :as _table}]
   (sql-jdbc.execute/do-with-connection-with-options
@@ -1120,9 +1202,11 @@
 
 (defmethod driver/create-schema-if-needed! :sqlserver
   [driver conn-spec schema]
+  ;; The quoted identifier is spliced inside the single-quoted EXEC('…') literal, so it must also be
+  ;; single-quote-escaped.
   (let [sql [[(format "IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '%s') EXEC('CREATE SCHEMA %s;');"
                       (sql.u/escape-sql schema :ansi)
-                      (quote-schema schema))]]]
+                      (sql.u/escape-sql (quote-schema schema) :ansi))]]]
     (driver/execute-raw-queries! driver conn-spec sql)))
 
 (defmethod driver/rename-table! :sqlserver
@@ -1170,9 +1254,14 @@
                            escaped-username quoted-user quoted-user)
                    (format "IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '%s') EXEC('CREATE SCHEMA %s')"
                            escaped-schema quoted-schema)
-                   ;; CONTROL ON SCHEMA gives ALTER (needed for creating objects in schema)
-                   (format "GRANT CONTROL ON SCHEMA::%s TO %s" quoted-schema quoted-user)
-                   ;; CREATE TABLE at database level is also required in SQL Server
+                   ;; Least-privilege grant on the workspace's own schema (vs. the old GRANT
+                   ;; CONTROL, dropping EXECUTE, VIEW DEFINITION, REFERENCES, and re-grant rights):
+                   ;;   ALTER  - create/drop/sp_rename objects in the schema
+                   ;;   SELECT, INSERT, UPDATE, DELETE - full DML (SQL Server, unlike Postgres,
+                   ;;            does not confer DML from ALTER/ownership, so grant it explicitly)
+                   (format "GRANT ALTER, SELECT, INSERT, UPDATE, DELETE ON SCHEMA::%s TO %s"
+                           quoted-schema quoted-user)
+                   ;; db-level CREATE TABLE: SELECT INTO (transform materialization) needs it too
                    (format "GRANT CREATE TABLE TO %s" quoted-user)]]
         (jdbc/execute! conn-spec [sql]))
       (catch Throwable t

@@ -35,10 +35,7 @@ import {
 } from "metabase/visualizations/components/legend/LegendCaption";
 import { extendCardWithDashcardSettings } from "metabase/visualizations/lib/settings/typed-utils";
 import { getComputedSettingsForSeries } from "metabase/visualizations/lib/settings/visualization";
-import type {
-  CardSlownessStatus,
-  ComputedVisualizationSettings,
-} from "metabase/visualizations/types";
+import type { CardSlownessStatus } from "metabase/visualizations/types";
 import {
   createDataSource,
   isVisualizerDashboardCard,
@@ -423,9 +420,7 @@ export function DashCardVisualization({
   );
 
   const cardTitle = useMemo(() => {
-    const settings = getComputedSettingsForSeries(
-      sanitizeSeriesData(series),
-    ) as ComputedVisualizationSettings;
+    const settings = getComputedSettingsForSeries(sanitizeSeriesData(series));
     return settings["card.title"] ?? series?.[0].card.name ?? "";
   }, [series]);
 
@@ -446,7 +441,9 @@ export function DashCardVisualization({
     });
 
   const actionButtons = useMemo(() => {
-    const result = series[0] as unknown as Dataset;
+    const cardId = dashcard.card_id ?? dashcard.card?.id;
+    const cardResult = cardId ? datasets?.[cardId] : undefined;
+    const result = cardResult ?? (series[0] as unknown as Dataset);
 
     const showMenu =
       question &&
@@ -457,9 +454,6 @@ export function DashCardVisualization({
         result,
       });
 
-    const cardResult = dashcard.card_id
-      ? datasets?.[dashcard.card_id]
-      : undefined;
     const errorStatus =
       cardResult?.error && typeof cardResult.error === "object"
         ? cardResult.error.status

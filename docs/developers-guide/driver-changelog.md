@@ -4,6 +4,33 @@ title: Driver interface changelog
 
 # Driver Interface Changelog
 
+## Metabase 0.63.0
+
+- New driver method `metabase.driver/refresh-table-stats!` `[driver database schema table transform-type]` --
+  refreshes table statistics (e.g. `ANALYZE`) after a transform run. Defaults to a no-op.
+
+- `metabase.driver/describe-table-fks`, deprecated in 0.49.0, has been removed. Please implement
+  `metabase.driver/describe-fks` instead. This method is now required for drivers that support
+  `:metadata/key-constraints`.
+
+  - JDBC-based drivers can implement `metabase.driver.sql-jdbc.sync.describe-table/describe-fks-sql` to take advantage
+    of a more performant shared `:sql-jdbc` implementation of `describe-fks`; if they do not implement this method
+    they will fall back to a default implementation of `describe-fks` that uses JDBC metadata for each matching table,
+    similar to the old default implementation of `describe-table-fks`.
+
+  - The `metabase.driver.sql-jdbc.sync/describe-table-fks` helper function has been removed, but helper functions
+    `metabase.driver.sql-jdbc.sync/reducible-fks-for-tables-matching-options` and
+    `metabase.driver.sql-jdbc.sync/reducible-table-fks-from-jdbc-metadata` have been added for use if you want to
+    write an implementation that works on a per-table basis similar to how the old `describe-table-fks` method worked.
+
+  - `metabase.driver-api.core/reducible-sync-tables` has been exposed in the driver API to fetch a set of matching
+    tables that match the `{:schema-names ... :table-names ...}` options passed to `describe-fks`, useful if you want
+    to implement a version that fetches FK metadata on a per-table basis.
+
+  - The `:describe-fks` driver feature flag has been removed as a feature since it is no longer needed to differentiate
+    between the aforementioned FK description methods; you should remove any `metabase.driver/database-supports?`
+    implementations for it.
+
 ## Metabase 0.62.0
 
 - `sql.params.substitution/field->clause`, `to-clause`, `desugar-filter-clause`, `wrap-value-literals-in-mbql`, and
@@ -124,6 +151,48 @@ title: Driver interface changelog
   or as a shortcut if the override is an identity function, add the abstract driver
   `:metabase.driver.sql.query-processor.like-escape-char-built-in/like-escape-char-built-in` as a parent of your driver.
   See `metabase.driver.mysql` for an example of using the abstract driver.
+
+## Metabase 0.58.23
+
+- `metabase.driver/connection-hosts` `[driver details]` -- new multimethod returning the host names pointed to for a set
+  of connection details. Where `details` is the connection-details map stored
+  on the Database row: the values an admin filled into the "Add a database" form, plus anything Metabase derived from them.
+  The default implementation parses hostnames out of `:host` and/or `:hostname`.
+  The SSH tunnel host is handled externally and should not be returned here.
+
+  If you cannot work out the hosts -- an unparseable connection URI, say -- throw rather than guessing or returning
+  an empty list. Metabase turns a throw into a refusal, which is the safe answer; an empty list reads as "these
+  details name no hosts" and lets the connection through unchecked. Return an empty list only when the details really
+  do name nowhere, as a file-backed database does.
+
+- `metabase.driver/host-carrying-parameters` `[driver]` -- new multimethod returning possible client parameters
+  that can carry a host that the client will connect to: a proxy, a failover partner, a token or authentication
+  endpoint, an alternate API endpoint, etc.
+
+  ```clj
+  (defmethod driver/host-carrying-parameters :sqlserver
+    [_driver]
+    ["serverName" "failoverPartner" "enclaveAttestationUrl"])
+  ```
+
+  To find possible parameter names, `java.sql.Driver/getPropertyInfo` enumerates every parameter it accepts.
+
+- `metabase.driver/non-host-parameters` `[driver]` -- new multimethod naming the parameters that LOOK
+  like they might carry a host but have been checked and do not: a certificate's expected hostname, a Kerberos
+  principal, a local bind address, a proxy's port, etc. Nothing reads it at connection time; it records that
+  somebody looked, so that `host-carrying-parameters` can be checked for completeness in tests against what
+  the client says it accepts. Does NOT have to include all non-host parameters. Just ones that sound like they might
+  but actually don't.
+
+- `metabase.driver/connection-parameter-hosts` `[driver details]` -- new multimethod returning the host *values*
+  those parameters hold, once the details, `:additional-options`, and any driver-specific rewriting have been folded
+  in. The default implementation is almost always valid, but exists as a possible multimethod for special cases
+  such as when your connection string is somewhere the default implementation cannot see.
+
+- `metabase.driver/routes-connection-through-ssh-tunnel?` `[driver]` -- new multimethod saying whether the driver
+  opens its warehouse connection through the SSH tunnel described by the `:tunnel-*` details.
+  Defaults to `false`, and to `true` for `:sql-jdbc` and everything beneath it. A non-`:sql-jdbc`
+  driver that opens a tunnel itself must implement this.
 
 ## Metabase 0.58.0
 
@@ -499,7 +568,7 @@ title: Driver interface changelog
   `metabase.test.data.sql.ddl/insert-rows-dml-statements`, since `INSERT` is DML, not DDL. Please update your method
   implementations accordingly.
 
-- The `:foreign-keys` driver feature has been removed. `:metadata/keys-constraints` should be used for drivers that
+- The `:foreign-keys` driver feature has been removed. `:metadata/key-constraints` should be used for drivers that
   support foreign key relationships reporting during sync. Implicit joins now depend on the `:left-join` feature
   instead. The default value is true for `:sql` based drivers. All join features are now enabled for `:sql` based
   drivers by default. Previously, those depended on the `:foreign-keys` feature. If your driver supports `:left-join`,

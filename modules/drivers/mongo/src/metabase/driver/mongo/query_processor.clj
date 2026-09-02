@@ -172,6 +172,13 @@
     :else
     [field-name]))
 
+(defn- raw-path->components
+  "Split a `parent.child.leaf`-style Mongo path string into a vector of path components. The Mongo driver
+  treats `.` as the unambiguous nested-key separator everywhere (sync, projection, ordering); literal dots in
+  document field names aren't supported."
+  [^String path]
+  (str/split path #"\."))
+
 (mu/defn field->name
   "Return a single string name for column metadata `col` For nested fields, this creates a combined qualified name."
   ([col]
@@ -209,10 +216,12 @@
   x)
 
 (defmethod ->rvalue :expression
-  [[_ expression-name]]
-  (let [expression-value (driver-api/expression-with-name (:query *query*) expression-name)]
-    (cond->> (->rvalue expression-value)
-      (driver-api/is-clause? :value expression-value) (array-map $literal))))
+  [[_ expression-name {:keys [temporal-unit]}]]
+  (let [expression-value (driver-api/expression-with-name (:query *query*) expression-name)
+        rvalue           (cond->> (->rvalue expression-value)
+                           (driver-api/is-clause? :value expression-value) (array-map $literal))]
+    (cond-> rvalue
+      temporal-unit (with-rvalue-temporal-bucketing temporal-unit))))
 
 (def ^:private base64-decoder "
 function(bin) {
@@ -484,6 +493,11 @@ function(bin) {
     ;; Passing nil or "" to the ObjectId or Binary constructor throws an exception
     (or (nil? value) (= value ""))
     value
+
+    (coll? value)
+    (throw (ex-info (tru "Invalid filter value: expected a scalar literal.")
+                    {:type driver-api/qp.error-type.invalid-query
+                     :value value}))
 
     (isa? base-type :type/MongoBSONID)
     (ObjectId. (str value))
@@ -866,6 +880,9 @@ function(bin) {
                    [:>= field min-val]
                    [:<= field max-val]]))
 
+(defn- escape-regex-literal [s]
+  (str/replace (str s) #"[.*+?^${}()|\[\]\\]" "\\\\$0"))
+
 (defn- str-match-pattern [field options prefix value suffix]
   (if (driver-api/is-clause? ::not value)
     {$not (str-match-pattern field options prefix (second value) suffix)}
@@ -874,7 +891,7 @@ function(bin) {
               "Wrong prefix or suffix value.")
       {$regexMatch {"input" (->rvalue field)
                     "regex" (if (= (first value) :value)
-                              (str prefix (->rvalue value) suffix)
+                              (str prefix (escape-regex-literal (->rvalue value)) suffix)
                               {$concat (into [] (remove nil?) [(when (some? prefix) {$literal prefix})
                                                                (->rvalue value)
                                                                (when (some? suffix) {$literal suffix})])})
@@ -909,12 +926,22 @@ function(bin) {
            (not (rvalue-is-variable? rvalue))
            (not (instance? java.util.regex.Pattern rvalue)))))
 
+(defn- literal-value?
+  "Whether the `value` argument of a comparison filter clause is a literal — a `:value` clause or a bare scalar."
+  [value]
+  (or (driver-api/is-clause? :value value)
+      (not (driver-api/mbql-clause? value))))
+
 (defn- filter-expr [operator field value]
-  (let [field-rvalue (->rvalue field)
-        value-rvalue (->rvalue value)]
+  (let [field-rvalue          (->rvalue field)
+        value-rvalue          (->rvalue value)
+        literal-value-rvalue? (and (literal-value? value)
+                                   (string? value-rvalue)
+                                   (str/starts-with? value-rvalue "$"))]
     (if (and (rvalue-is-field? field-rvalue)
-             (not (rvalue-is-field? value-rvalue))
-             (rvalue-can-be-compared-directly? value-rvalue))
+             (or literal-value-rvalue?
+                 (and (not (rvalue-is-field? value-rvalue))
+                      (rvalue-can-be-compared-directly? value-rvalue))))
       ;; if we don't need to do anything fancy with field we can generate a clause like
       ;;
       ;;    {field {$lte 100}}
@@ -926,7 +953,8 @@ function(bin) {
       ;; if we need to do something fancy then we have to use `$expr` e.g.
       ;;
       ;;    {$expr {$lte [{$add [$field 1]} 100]}}
-      {$expr {operator [field-rvalue value-rvalue]}})))
+      {$expr {operator [field-rvalue (cond->> value-rvalue
+                                       literal-value-rvalue? (array-map $literal))]}})))
 
 (defmethod compile-filter :=  [[_ field value]] (filter-expr $eq field value))
 (defmethod compile-filter :!= [[_ field value]] (filter-expr $ne field value))
@@ -1091,10 +1119,12 @@ function(bin) {
                      [:field _ (opts :guard (not= (:join-alias opts) alias))] &match)
         ;; Map the own fields to a fresh alias and to its rvalue.
         mapping (map (fn [f] (let [alias (-> (format "let_%s_" (->lvalue f))
-                                             ;; ~ in let aliases provokes a parse error in Mongo. For correct function,
-                                             ;; aliases should also contain no . characters (#32182).
-                                             ;; - Spaces are allowed in columns and need to be replaced in let (#52807)
-                                             (str/replace #"[~\. -]" "_")
+                                             ;; Mongo `$lookup` let variable names allow ASCII letters, digits,
+                                             ;; underscores, and non-ASCII characters; any other ASCII character
+                                             ;; (e.g. `~`, `.`, space, `-`, `:`) trips a parser error. Match only
+                                             ;; disallowed ASCII characters so non-ASCII chars in source names are
+                                             ;; preserved (#32182, #52807, #76722).
+                                             (str/replace #"[\p{ASCII}&&[^A-Za-z0-9_]]" "_")
                                              (str "__" (next-alias-index)))]
                                {:field f, :rvalue (->rvalue f), :alias alias}))
                      own-fields)]
@@ -1472,10 +1502,7 @@ function(bin) {
      (assoc-in
       m
       (match/match-one field-clause
-        [:field (field-id :guard integer?) _]
-        (str/split (field-alias field-clause) #"\.")
-
-        [:field (field-name :guard string?) _]
+        [:field (id :guard (or (integer? id) (string? id))) _]
         (str/split (field-alias field-clause) #"\.")
 
         [:expression expr-name _]
@@ -1529,12 +1556,22 @@ function(bin) {
   (vec (col->name-components (driver-api/field (driver-api/metadata-provider) field-id))))
 
 (defn- field-clauses->id->path
-  "Build a map of `field-id -> path-vector` for all `:field` clauses in `fields` that reference an integer ID."
+  "Build a map of `field-id-or-name -> path-vector` for all `:field` clauses in `fields`. Integer IDs are
+  resolved via the metadata provider; for string refs (e.g. from a wrapper stage), the path is derived from
+  the opts `:source-alias` populated by `add-alias-info` (and path-prepended by [[HACK-update-aliases]] for
+  nested fields), falling back to `id-or-name` when no source-alias is present. The path-joined string is
+  split on the Mongo path delimiter."
   [fields]
   (into {}
-        (keep (fn [[agg-type field-id & _]]
-                (when (and (= agg-type :field) (integer? field-id))
-                  [field-id (field-id->path field-id)])))
+        (keep (fn [[agg-type id-or-name opts]]
+                (when (= agg-type :field)
+                  (cond
+                    (integer? id-or-name)
+                    [id-or-name (field-id->path id-or-name)]
+
+                    (string? id-or-name)
+                    [id-or-name (raw-path->components
+                                 (get opts driver-api/qp.add.source-alias id-or-name))]))))
         fields))
 
 (defn- remove-parent-fields
@@ -1550,9 +1587,9 @@ function(bin) {
                                    (when (> (count path) 1)
                                      (vec (butlast path)))))
                            (vals id->path))]
-    (remove (fn [[_ field-id & _]]
-              (and (integer? field-id)
-                   (contains? parent-paths (id->path field-id))))
+    (remove (fn [[agg-type id-or-name & _]]
+              (and (= agg-type :field)
+                   (contains? parent-paths (id->path id-or-name))))
             fields)))
 
 (defn- remove-child-fields
@@ -1565,10 +1602,11 @@ function(bin) {
   [fields]
   (let [id->path  (field-clauses->id->path fields)
         all-paths (set (vals id->path))]
-    (remove (fn [[agg-type field-id]]
-              (when (and (= agg-type :field) (integer? field-id))
-                (let [path (id->path field-id)]
-                  (and (> (count path) 1)
+    (remove (fn [[agg-type id-or-name]]
+              (when (= agg-type :field)
+                (let [path (id->path id-or-name)]
+                  (and path
+                       (> (count path) 1)
                        (contains? all-paths (vec (butlast path)))))))
             fields)))
 
@@ -1689,8 +1727,7 @@ function(bin) {
 
 (defn- log-aggregation-pipeline [form]
   (when-not driver-api/*disable-qp-logging*
-    (log/tracef "\nMongo aggregation pipeline:\n%s\n"
-                (u/pprint-to-str 'green (perf/postwalk #(if (symbol? %) (symbol (name %)) %) form)))))
+    (log/tracef "Compiled Mongo aggregation pipeline with %d stage(s)" (count form))))
 
 (defn simple-mbql->native
   "Compile a simple (non-nested) MBQL query."

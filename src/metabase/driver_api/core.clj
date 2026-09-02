@@ -101,6 +101,7 @@
  lib.metadata/transforms
  lib.schema.common/instance-of-class
  lib.schema.temporal-bucketing/date-bucketing-units
+ lib.schema.temporal-bucketing/datetime-interval-units
  lib.types.isa/temporal?
  match/match-one
  match/match-many
@@ -171,6 +172,7 @@
  secrets/uploaded-base-64-prefix-pattern
  setting/defsetting
  sync-util/name-for-logging
+ sync-util/reducible-sync-tables
  system/site-uuid
  upload.db/current-database)
 
@@ -192,6 +194,8 @@
 
 (p/import-fn lib/unique-name-generator-with-options unique-name-generator)
 
+(p/import-def qp.error-type/connection-pool-checkout-queue-full qp.error-type.connection-pool-checkout-queue-full)
+(p/import-def qp.error-type/connection-pool-checkout-timeout qp.error-type.connection-pool-checkout-timeout)
 (p/import-def qp.error-type/db qp.error-type.db)
 (p/import-def qp.error-type/driver qp.error-type.driver)
 (p/import-def qp.error-type/invalid-parameter qp.error-type.invalid-parameter)

@@ -12,6 +12,7 @@ export type DatabaseSettings = {
   "database-enable-actions"?: boolean;
   "database-enable-table-editing"?: boolean;
   "database-editable-table-ids"?: number[] | string[];
+  "database-enable-workspaces"?: boolean;
 };
 
 export type DatabaseFeature =
@@ -123,6 +124,7 @@ export interface DatabaseUsageInfo {
   dataset: number;
   metric: number;
   segment: number;
+  transform: number;
 }
 
 export interface GetDatabaseRequest {
@@ -206,7 +208,7 @@ export interface GetDatabaseMetadataRequest {
   include_hidden?: boolean;
   include_editable_data_model?: boolean;
   remove_inactive?: boolean;
-  skip_fields?: boolean;
+  skip_fields: true; // make sure we don't get every field of every table
 }
 
 export interface CreateDatabaseRequest {

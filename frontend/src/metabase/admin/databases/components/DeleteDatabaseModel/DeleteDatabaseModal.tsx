@@ -102,9 +102,7 @@ export const DeleteDatabaseModal = ({
   const canDelete =
     (isContentRemovalConfirmed || !hasContent) && isDatabaseNameConfirmed;
 
-  const deleteButtonLabel = hasContent
-    ? t`Delete this content and the DB connection`
-    : t`Delete`;
+  const deleteButtonLabel = t`Delete this DB connection`;
 
   const errorMessage = getErrorMessage(error);
   const hasMoreThanOneEntityType = usageInfo && entityTypesCount(usageInfo) > 1;
@@ -139,7 +137,7 @@ export const DeleteDatabaseModal = ({
                     <UnstyledButton
                       key="button"
                       onClick={handleEditConnectionDetailsClick}
-                      c="brand"
+                      c="core-brand"
                       fw="bold"
                     >{t`edit your connection details.`}</UnstyledButton>
                   )}`}
@@ -190,13 +188,13 @@ export const DeleteDatabaseModal = ({
           </DeleteDatabaseModalSection>
           <Flex gap="sm" justify="flex-end" align="center">
             {errorMessage && (
-              <Box c="error" px="md">
+              <Box c="feedback-negative" px="md">
                 {errorMessage}
               </Box>
             )}
             <Button type="button" onClick={onClose}>{t`Cancel`}</Button>
             <Button
-              color="error"
+              color="feedback-negative"
               variant="filled"
               type="submit"
               disabled={!canDelete}

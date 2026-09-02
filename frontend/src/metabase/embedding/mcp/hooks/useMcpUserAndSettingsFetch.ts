@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 
 import type { SdkStore } from "embedding-sdk-bundle/store/types";
+import { userApi } from "metabase/api";
+import { runRtkEndpoint } from "metabase/api/utils/run-rtk-endpoint";
 import { refreshSiteSettings } from "metabase/redux/settings";
 import { userUpdated } from "metabase/redux/user";
-import { UserApi } from "metabase/services";
 
 import {
   type McpAppsUserAndSettingsFetchErrorType,
@@ -13,7 +14,7 @@ import {
 
 interface UseMcpUserAndSettingsFetchOptions {
   instanceUrl: string;
-  sessionToken: string;
+  uiCredential: string;
   store: SdkStore;
 }
 
@@ -24,7 +25,7 @@ interface UseMcpUserAndSettingsFetchResult {
 
 export function useMcpUserAndSettingsFetch({
   instanceUrl,
-  sessionToken,
+  uiCredential,
   store,
 }: UseMcpUserAndSettingsFetchOptions): UseMcpUserAndSettingsFetchResult {
   const [isSettingsReady, setIsSettingsReady] = useState(false);
@@ -35,6 +36,10 @@ export function useMcpUserAndSettingsFetch({
   // selectors like getTokenFeature has populated settings.
   // We also no-op the EE auth flow (auth.ts) when in MCP Apps route.
   useEffect(() => {
+    if (isSettingsReady) {
+      return;
+    }
+
     let isMounted = true;
 
     const setErrorByType = (type: McpAppsUserAndSettingsFetchErrorType) =>
@@ -45,8 +50,7 @@ export function useMcpUserAndSettingsFetch({
         setIsSettingsReady(false);
         setFetchError(null);
 
-        if (!sessionToken) {
-          setErrorByType("auth");
+        if (!uiCredential) {
           return;
         }
 
@@ -56,7 +60,11 @@ export function useMcpUserAndSettingsFetch({
         }
 
         const [currentUser] = await Promise.all([
-          UserApi.current(),
+          runRtkEndpoint(
+            undefined,
+            store.dispatch,
+            userApi.endpoints.getCurrentUser,
+          ),
           store.dispatch(refreshSiteSettings()),
         ]);
 
@@ -80,7 +88,7 @@ export function useMcpUserAndSettingsFetch({
     return () => {
       isMounted = false;
     };
-  }, [instanceUrl, sessionToken, store]);
+  }, [instanceUrl, isSettingsReady, uiCredential, store]);
 
   return { isSettingsReady, userAndSettingsFetchError: fetchError };
 }

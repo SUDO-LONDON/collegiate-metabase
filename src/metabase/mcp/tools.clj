@@ -73,12 +73,18 @@
   `::lib.schema/external-query` — that pulls in `::query`'s `:optional` non-nullable
   `:lib/metadata` (and emits `prefixItems` / `allOf` JSON Schema constructs that strict MCP
   clients reject). This override publishes the same opaque-object `:query` field used by
-  `construct_query`, plus the `:continuation_token` alternative for pagination."
+  `construct_query`, plus the `:query_handle` and `:continuation_token` alternatives. The handle
+  is swapped for the stored base64 `:query` by [[resolve-query-arg]] before dispatch."
   [:map
    [:query              {:optional true
-                         :tool/description (str "Metabase MBQL 5 query. "
-                                                "Omit when paginating via `continuation_token`.")}
+                         :tool/description (str "Metabase MBQL 5 query. Use `query_handle` instead "
+                                                "when you have one. Omit when paginating via "
+                                                "`continuation_token`.")}
     [:maybe external-query-mcp-malli]]
+   [:query_handle       {:optional true
+                         :tool/description (str "Handle returned by construct_query — preferred over "
+                                                "raw `query`.")}
+    [:maybe ms/UUIDString]]
    [:continuation_token {:optional true
                          :tool/description (str "Token returned by a previous `query` response — pass "
                                                 "it back to fetch the next page. Mutually exclusive "
@@ -114,8 +120,11 @@
    "execute_query"   execute-query-mcp-input-malli})
 
 (def ^:private mcp-output-overrides
-  "tool-name → Malli schema. Replaces the manifest's derived `:outputSchema`."
-  {"construct_query" construct-query-mcp-output-malli})
+  "tool-name → Malli schema. Replaces the manifest's derived `:outputSchema`.
+   Both construct tools emit `{:query_handle}` via the body transform (see
+   [[tools-storing-query-handle]]), so they share the same output schema."
+  {"construct_query"        construct-query-mcp-output-malli
+   "construct_native_query" construct-query-mcp-output-malli})
 
 (defn- override->input-json-schema [malli tool-name]
   (tools-manifest/assert-optional-fields-nullable! malli tool-name)
@@ -295,7 +304,7 @@
   (mr/validator construct-query-mcp-output-malli))
 
 (defn- make-store-construct-query-result
-  "Build a body-transform fn for construct_query.
+  "Build a body-transform fn for the construct tools (`construct_query`, `construct_native_query`).
    The fn stores the base64 payload server-side under the calling user (with the current MCP session id
    recorded for cleanup) and returns {:query_handle uuid} instead of {:query base64}, so the LLM carries
    a short opaque UUID rather than the full base64 string.
@@ -316,9 +325,17 @@
         new-body)
       body)))
 
-;; Tools that accept :query_handle as an alternative to a raw base64 :query string.
+;; Tools whose :query_handle is resolved by `resolve-query-arg` (it swaps the handle for the stored
+;; base64 :query) before the agent-api dispatch in `call-tool`. `visualize_query` also accepts a
+;; handle, but it's a UI tool that resolves the handle itself (see `metabase.mcp.resources`) and
+;; never reaches this dispatch path, so it's intentionally absent here.
 (def ^:private tools-accepting-query-handle
-  #{"execute_query" "visualize_query" "create_question" "update_question"})
+  #{"execute_query" "query" "create_question" "update_question" "create_metric" "update_metric"})
+
+;; Tools whose 200 body is `{:query base64}` and gets stored as a handle, returning `{:query_handle}`.
+;; `construct_query` (MBQL) and `construct_native_query` (native SQL) both follow this contract.
+(def ^:private tools-storing-query-handle
+  #{"construct_query" "construct_native_query"})
 
 ;;; ------------------------------------------------- Tool Dispatch -------------------------------------------------
 
@@ -437,7 +454,7 @@
         [resolved-path
          remaining-args]      (interpolate-path path arguments)
         api-path              (strip-api-prefix resolved-path)
-        body-transform-fn     (when (= tool-name "construct_query")
+        body-transform-fn     (when (tools-storing-query-handle tool-name)
                                 (make-store-construct-query-result
                                  session-id api/*current-user-id*))]
     (invoke-agent-api method api-path token-scopes remaining-args

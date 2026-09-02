@@ -5,7 +5,14 @@ import type { SchemaObjectDescription } from "yup/lib/schema";
 
 import { cronToScheduleSettings } from "metabase/common/components/Schedule/cron";
 import { getScheduleStrings } from "metabase/common/components/Schedule/strings";
-import { PLUGIN_CACHING } from "metabase/plugins";
+import {
+  PLUGIN_CACHING,
+  type PerformanceTabId,
+  type StrategyData,
+  type StrategyLabel,
+  defaultMinDurationMs,
+  strategies,
+} from "metabase/plugins";
 import { isNullOrUndefined } from "metabase/utils/types";
 import type {
   AdaptiveStrategy,
@@ -14,19 +21,18 @@ import type {
   CacheStrategyType,
   CacheableModel,
 } from "metabase-types/api";
+import { isObject } from "metabase-types/guards";
 
-import { strategies } from "./constants/complex";
-import { defaultMinDurationMs, rootId } from "./constants/simple";
-import type { PerformanceTabId, StrategyData, StrategyLabel } from "./types";
+import { rootId } from "./constants/simple";
 
 type ErrorWithMessage = { data: { message: string } };
 export const isErrorWithMessage = (error: unknown): error is ErrorWithMessage =>
   typeof error === "object" &&
   error !== null &&
   "data" in error &&
-  typeof (error as { data: any }).data === "object" &&
-  "message" in (error as { data: any }).data &&
-  typeof (error as { data: { message: any } }).data.message === "string";
+  isObject(error.data) &&
+  "message" in error.data &&
+  typeof error.data.message === "string";
 
 const delay = (milliseconds: number) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));

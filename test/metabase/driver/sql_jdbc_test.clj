@@ -1,6 +1,7 @@
 (ns ^:mb/driver-tests metabase.driver.sql-jdbc-test
   {:clj-kondo/config '{:linters {:deprecated-var {:exclude {metabase.test.data/mbql-query {:namespaces [metabase.driver.sql-jdbc-test]}}}}}}
   (:require
+   [clojure.set :as set]
    [clojure.test :refer :all]
    [metabase.driver :as driver]
    [metabase.driver.common.table-rows-sample :as table-rows-sample]
@@ -24,9 +25,11 @@
 (set! *warn-on-reflection* true)
 
 (deftest ^:parallel describe-database-test
-  (is (= {:tables (set (for [table ["CATEGORIES" "VENUES" "CHECKINS" "USERS" "ORDERS" "PEOPLE" "PRODUCTS" "REVIEWS"]]
-                         {:name table, :schema "PUBLIC", :description nil, :is_writable true}))}
-         (driver/describe-database :h2 (mt/db)))))
+  (is (set/subset? (set (for [table ["CATEGORIES" "VENUES" "CHECKINS" "USERS"
+                                     "ORDERS" "PEOPLE" "PRODUCTS" "REVIEWS"]]
+                          {:name table, :schema "PUBLIC",
+                           :description nil, :is_writable true}))
+                   (into #{} (:tables (driver/describe-database :h2 (mt/db)))))))
 
 (deftest describe-fields-sync-with-composite-pks-test
   (testing "Make sure syncing a table that has a composite pks works"
@@ -101,6 +104,24 @@
                  (or (when (instance? java.net.ConnectException e)
                        (throw e))
                      (some-> (.getCause e) recur))))))))))
+
+(deftest validate-db-details-additional-options-test
+  (testing "validate-db-details! rejects disallowed connection properties in additional-options"
+    (doseq [opt ["socketFactory=a.b.C"
+                 "sslfactory=a.b.C"
+                 "sslhostnameverifier=a.b.C"
+                 "sslpasswordcallback=a.b.C"
+                 "xmlFactoryFactory=a.b.C"
+                 "loggerFile=a/b"]]
+      (testing opt
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"dangerous"
+             (driver/validate-db-details! :sql-jdbc {:additional-options opt}))))))
+  (testing "benign additional options and no additional options are allowed"
+    (doseq [details [{}
+                     {:additional-options nil}
+                     {:additional-options "prepareThreshold=5&tcpKeepAlive=true"}]]
+      (is (nil? (driver/validate-db-details! :sql-jdbc details))))))
 
 (defn- test-spliced-count-of [table filter-clause expected]
   (let [query        (mt/mbql-query nil

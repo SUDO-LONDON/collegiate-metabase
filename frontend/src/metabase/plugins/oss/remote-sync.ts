@@ -7,16 +7,13 @@ import type { ComponentType, ReactNode } from "react";
 
 import type { TagType } from "metabase/api/tags";
 import type { UseQuery } from "metabase/api/types/rtk";
-import type { CollectionTreeItem } from "metabase/collections/utils";
+import type { CollectionTreeItem } from "metabase/common/collections/utils";
 import type { ITreeNodeItem } from "metabase/common/components/tree/types";
 import type {
   GitSyncSetupMenuItemProps,
   SyncedCollectionsSidebarSectionProps,
 } from "metabase/plugins";
-import {
-  NotFoundPlaceholder,
-  PluginPlaceholder,
-} from "metabase/plugins/components/PluginPlaceholder";
+import { PluginPlaceholder } from "metabase/plugins/components/PluginPlaceholder";
 import type { State } from "metabase/redux/store";
 import type {
   RemoteSyncChangesResponse,
@@ -62,7 +59,7 @@ export interface RemoteSyncDirtyState {
 const getDefaultPluginRemoteSync = () => ({
   isEnabled: false,
   LibraryNav: PluginPlaceholder,
-  RemoteSyncSettings: NotFoundPlaceholder,
+  RemoteSyncSettings: PluginPlaceholder,
   SyncedCollectionsSidebarSection: PluginPlaceholder,
   GitSyncAppBarControls: PluginPlaceholder as ComponentType,
   GitSettingsModal: PluginPlaceholder as ComponentType<GitSettingsModalProps>,

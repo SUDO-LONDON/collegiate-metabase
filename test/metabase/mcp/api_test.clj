@@ -5,6 +5,7 @@
    [clojure.walk :as walk]
    [metabase.agent-api.settings :as agent-api.settings]
    [metabase.api.macros.scope :as scope]
+   [metabase.collections.models.collection :as collection]
    [metabase.lib.core :as lib]
    [metabase.lib.metadata :as lib.metadata]
    [metabase.mcp.api :as mcp.api]
@@ -20,6 +21,7 @@
    [metabase.test.fixtures :as fixtures]
    [metabase.test.http-client :as client]
    [metabase.util.json :as json]
+   [oidc-provider.store :as oidc.store]
    [throttle.core :as throttle]
    [toucan2.core :as t2]))
 
@@ -69,6 +71,13 @@
                                {:request-options {:headers (merge {"authorization" (str "Bearer " bearer-token)}
                                                                   extra-headers)}}
                                body))
+
+(defn- save-access-token!
+  "Persist an OAuth access token into the provider backing the MCP endpoint."
+  [token user-id scopes]
+  (oidc.store/save-access-token (:token-store (oauth-server/get-provider))
+                                token (str user-id) "test-client" (vec scopes)
+                                (+ (inst-ms (java.util.Date.)) 3600000) nil))
 
 (defn- mcp-delete
   "Make a DELETE request to /api/mcp with optional headers.
@@ -208,6 +217,13 @@
                                   {"host"   "mbtest.poom.dev"
                                    "origin" "HTTPS://example.com"})]
         (is (= 200 (:status response)))
+        (is (some? (get-in response [:headers "Mcp-Session-Id"]))))))
+  (testing "a trailing slash on a configured MCP CORS origin has no effect (#75839)"
+    (mt/with-temporary-setting-values [mcp.settings/mcp-apps-cors-custom-origins "http://127.0.0.1:6274/"]
+      (let [response (mcp-request (jsonrpc-request "initialize")
+                                  {"host"   "mbtest.poom.dev"
+                                   "origin" "http://127.0.0.1:6274"})]
+        (is (= 200 (:status response)))
         (is (some? (get-in response [:headers "Mcp-Session-Id"])))))))
 
 (deftest mcp-enabled-setting-test
@@ -263,16 +279,21 @@
 
 (def ^:private all-tool-names
   #{"construct_query"
+    "construct_native_query"
     "create_collection"
     "create_dashboard"
+    "create_metric"
     "create_question"
     "execute_query"
+    "execute_question"
     "execute_sql"
     "query"
     "read_resource"
+    "refresh_ui_credential"
     "render_drill_through"
     "search"
     "update_dashboard"
+    "update_metric"
     "update_question"
     "visualize_query"})
 
@@ -298,7 +319,11 @@
     (let [[session-id _] (initialize-without-ui!)
           response       (mcp-request (jsonrpc-request "tools/list") {"mcp-session-id" session-id})
           tool-names     (set (map :name (get-in response [:body :result :tools])))]
-      (is (= (disj all-tool-names "visualize_query" "render_drill_through") tool-names))
+      (is (= (apply disj all-tool-names
+                    ["visualize_query"
+                     "render_drill_through"
+                     "refresh_ui_credential"])
+             tool-names))
       (is (not (contains? tool-names "visualize_query")))
       (is (not (contains? tool-names "render_drill_through")))))
   (testing "clients that advertise MCP Apps UI support see UI-only tools"
@@ -650,15 +675,16 @@
    below) — the test compares this set against the Agent API-backed tools and
    fails when they diverge, ensuring no Agent API tool ships without a basic
    invocation check."
-  #{"search" "construct_query" "query" "execute_query" "execute_sql"
+  #{"search" "construct_query" "construct_native_query" "query" "execute_query" "execute_sql"
     "read_resource"
-    "create_question" "create_dashboard"
-    "update_question" "update_dashboard" "create_collection"})
+    "create_question" "execute_question" "create_metric" "create_dashboard"
+    "update_question" "update_metric" "update_dashboard" "create_collection"})
 
 (deftest tools-call-smoke-test-covers-all-agent-api-backed-tools-test
   (testing "every Agent API-backed tool is exercised by the smoke test"
-    (is (= (apply disj (set (map :name (mcp.tools/list-tools nil)))
-                  ["visualize_query" "render_drill_through"])
+    (is (= (apply disj
+                  (set (map :name (mcp.tools/list-tools nil)))
+                  (map :name (mcp.resources/list-ui-tools)))
            smoke-tested-tools)
         "Add the missing tool to `smoke-tested-tools` and the call sequence below.")))
 
@@ -676,9 +702,15 @@
                                 :stages   [{:lib/type     "mbql.stage/mbql"
                                             :source-table [db-name "PUBLIC" "ORDERS"]
                                             :limit        5}]}
+                ;; A metric needs exactly one aggregation — `create_metric` rejects a plain query.
+                metric-query   {:lib/type "mbql/query"
+                                :stages   [{:lib/type     "mbql.stage/mbql"
+                                            :source-table [db-name "PUBLIC" "ORDERS"]
+                                            :aggregation  [["count" {}]]}]}
                 ;; Track write-tool outputs in atoms so the `finally` cleanup runs even if an
                 ;; assertion in `call-tool` fails partway through the sequence.
                 question-id    (atom nil)
+                metric-id      (atom nil)
                 dash-id        (atom nil)
                 coll-id        (atom nil)]
             (try
@@ -686,6 +718,10 @@
                     _              (call-tool session-id "search" {:term_queries ["orders"]})
                     ;; Query construction + execution
                     construct-data (call-tool session-id "construct_query" {:query orders-query})
+                    native-data    (call-tool session-id "construct_native_query"
+                                              {:database_id (mt/id)
+                                               :sql         "SELECT 1"})
+                    _              (is (uuid? (parse-uuid (:query_handle native-data))))
                     _              (call-tool session-id "query" {:query orders-query})
                     _              (call-tool session-id "execute_query"
                                               {:query_handle (:query_handle construct-data)})
@@ -704,9 +740,24 @@
                     _              (reset! question-id (:id question-data))
                     _              (is (= (format "https://stats.metabase.test/question/%d" @question-id)
                                           (:url question-data)))
+                    ;; No collection_id given → defaults to the caller's personal collection;
+                    ;; collection_path must survive MCP forwarding.
+                    _              (is (= (collection/user->personal-collection-name (mt/user->id :crowberto) :user)
+                                          (:collection_path question-data)))
                     _              (call-tool session-id "update_question"
                                               {:id          (:id question-data)
                                                :description "Smoke updated description"})
+                    metric-handle  (call-tool session-id "construct_query" {:query metric-query})
+                    metric-data    (call-tool session-id "create_metric"
+                                              {:name         "Smoke Metric Card"
+                                               :query_handle (:query_handle metric-handle)})
+                    _              (reset! metric-id (:id metric-data))
+                    _              (is (= "scalar" (:display metric-data)))
+                    _              (call-tool session-id "update_metric"
+                                              {:id          (:id metric-data)
+                                               :description "Smoke updated metric"})
+                    _              (call-tool session-id "execute_question"
+                                              {:id (:id question-data)})
                     dash-data      (call-tool session-id "create_dashboard"
                                               {:name "Smoke Dashboard"})
                     _              (reset! dash-id (:id dash-data))
@@ -720,6 +771,7 @@
                 (reset! coll-id (:id coll-data)))
               (finally
                 (when-let [qid @question-id] (t2/delete! :model/Card :id qid))
+                (when-let [mid @metric-id]   (t2/delete! :model/Card :id mid))
                 (when-let [did @dash-id]     (t2/delete! :model/Dashboard :id did))
                 (when-let [cid @coll-id]     (t2/delete! :model/Collection :id cid))))))))))
 
@@ -730,6 +782,57 @@
       (is (=? {:content           [{:type "text"}]
                :structuredContent {:query "card__1"}}
               result)))))
+
+(deftest ui-tools-do-not-return-ui-credentials-test
+  (testing "visualization tools leave credential minting to their app-only refresh tools"
+    (let [[session-id _]  (initialize!)
+          visualize-result (get-in (mcp-request (jsonrpc-request "tools/call"
+                                                                 {:name      "visualize_query"
+                                                                  :arguments {:query "card__1"}})
+                                                {"mcp-session-id" session-id})
+                                   [:body :result])
+          handle           (mt/with-current-user (mt/user->id :crowberto)
+                             (mcp.session/store-handle! session-id
+                                                        (mt/user->id :crowberto)
+                                                        "card__2"))
+          drill-result     (get-in (mcp-request (jsonrpc-request "tools/call"
+                                                                 {:name      "render_drill_through"
+                                                                  :arguments {:handle handle}})
+                                                {"mcp-session-id" session-id})
+                                   [:body :result])]
+      (is (nil? (get-in visualize-result [:_meta :com.metabase/mcp-apps])))
+      (is (nil? (get-in drill-result [:_meta :com.metabase/mcp-apps]))))))
+
+(deftest mcp-ui-auth-refresh-tools-test
+  (testing "UI auth refresh tools are app-only and inherit their resource scopes"
+    (let [[session-id _] (initialize!)
+          tools          (get-in (mcp-request (jsonrpc-request "tools/list")
+                                              {"mcp-session-id" session-id})
+                                 [:body :result :tools])
+          tools-by-name  (into {} (map (juxt :name identity)) tools)
+          refresh-tool   (get tools-by-name "refresh_ui_credential")]
+      (is (=? {:_meta {:ui {:visibility ["app"]}}}
+              refresh-tool))
+      (is (nil? (get-in refresh-tool [:_meta :ui :resourceUri]))))
+    (let [query-tools (into #{} (map :name)
+                            (mcp.tools/list-tools #{"agent:viz:mcp-ui:query"}))
+          drill-tools (into #{} (map :name)
+                            (mcp.tools/list-tools #{"agent:viz:mcp-ui:drill-through"}))]
+      (is (contains? query-tools "refresh_ui_credential"))
+      (is (contains? drill-tools "refresh_ui_credential"))))
+  (testing "a refresh call returns session-bound auth only in private metadata"
+    (let [[session-id _] (initialize!)
+          result         (get-in (mcp-request
+                                  (jsonrpc-request "tools/call"
+                                                   {:name      "refresh_ui_credential"
+                                                    :arguments {}})
+                                  {"mcp-session-id" session-id})
+                                 [:body :result])
+          credential     (get-in result [:_meta :com.metabase/mcp-apps :credential])]
+      (is (string? credential))
+      (is (= session-id (get-in result [:_meta :com.metabase/mcp-apps :sessionId])))
+      (is (not (str/includes? (pr-str (select-keys result [:content :structuredContent]))
+                              credential))))))
 
 (deftest tools-call-rejects-ui-tools-without-ui-capability-test
   (testing "direct calls to UI-only tools are rejected for clients without MCP Apps UI support"
@@ -766,6 +869,36 @@
                    :data      {:cols sequential?
                                :rows (fn [rows] (= 5 (count rows)))}}
                   execute-data)))))))
+
+(deftest tools-call-query-accepts-query-handle-test
+  (testing "the `query` tool resolves a query_handle and streams results, same as a fresh query body"
+    (let [[session-id _] (initialize!)
+          db-name        (t2/select-one-fn :name :model/Database (mt/id))
+          external-query {:lib/type "mbql/query"
+                          :stages   [{:lib/type     "mbql.stage/mbql"
+                                      :source-table [db-name "PUBLIC" "ORDERS"]
+                                      :limit        5}]}
+          construct-data (call-tool session-id "construct_query" {:query external-query})
+          query-data     (call-tool session-id "query"
+                                    {:query_handle (:query_handle construct-data)})]
+      (is (=? {:status             "completed"
+               :row_count          5
+               :continuation_token nil?
+               :data               {:cols sequential?
+                                    :rows (fn [rows] (= 5 (count rows)))}}
+              query-data)))))
+
+(deftest tools-call-query-stale-query-handle-test
+  (testing "the `query` tool returns a tool-level error for an unknown handle rather than a 500"
+    (let [[session-id _] (initialize!)
+          result         (mcp-request (jsonrpc-request "tools/call"
+                                                       {:name      "query"
+                                                        :arguments {:query_handle (str (random-uuid))}})
+                                      {"mcp-session-id" session-id})]
+      (is (=? {:status 200
+               :body   {:result {:isError true
+                                 :content [{:text #(str/includes? % "Query handle not found")}]}}}
+              result)))))
 
 (deftest tools-call-create-question-accepts-query-handle-test
   (testing "create_question resolves query_handle through the MCP layer instead of requiring raw base64"
@@ -1334,6 +1467,37 @@
       (is (empty? tools)
           "Empty scopes should not grant access to scoped tools"))))
 
+(deftest oauth-token-scope-validation-test
+  (testing "an OAuth token with a limited scope exposes only matching tools"
+    (mt/with-temporary-setting-values [site-url "http://localhost:3000"]
+      (t2/with-transaction [_conn nil {:rollback-only true}]
+        (oauth-server/reset-provider!)
+        (let [token (str (random-uuid))]
+          (save-access-token! token (mt/user->id :crowberto) #{"agent:search"})
+          (let [sid        (-> (mcp-request-with-bearer token 200 (jsonrpc-request "initialize") {})
+                               (get-in [:headers "Mcp-Session-Id"]))
+                response   (mcp-request-with-bearer token 200 (jsonrpc-request "tools/list")
+                                                    {"mcp-session-id" sid})
+                tool-names (set (map :name (get-in response [:body :result :tools])))]
+            (is (contains? tool-names "search"))
+            (is (not (contains? tool-names "update_question"))
+                "Only matching tools should be available")))))))
+
+(deftest full-access-token-scope-validation-test
+  (testing "an OAuth token with the full-access grant exposes all tools"
+    (mt/with-temporary-setting-values [site-url "http://localhost:3000"]
+      (t2/with-transaction [_conn nil {:rollback-only true}]
+        (oauth-server/reset-provider!)
+        (let [token (str (random-uuid))]
+          (save-access-token! token (mt/user->id :crowberto) #{oauth-server/full-access-scope})
+          (let [sid        (-> (mcp-request-with-bearer token 200 (jsonrpc-request "initialize") {})
+                               (get-in [:headers "Mcp-Session-Id"]))
+                response   (mcp-request-with-bearer token 200 (jsonrpc-request "tools/list")
+                                                    {"mcp-session-id" sid})
+                tool-names (set (map :name (get-in response [:body :result :tools])))]
+            (is (contains? tool-names "search"))
+            (is (contains? tool-names "update_question"))))))))
+
 (defn- insert-expired-oauth-token!
   "Insert an OAuth access token into the DB with an expiry in the past.
    Returns the token string."
@@ -1471,8 +1635,8 @@
 
 ;;; -------------------------------------------- Session Lifecycle -------------------------------------------------
 
-(deftest session-embedding-reuse-test
-  (testing "multiple resources/read calls within one session reuse the same embedding session"
+(deftest resources-read-renders-ui-configuration-test
+  (testing "UI resources contain stable configuration without a short-lived credential"
     (let [[session-id _] (initialize!)
           read1 (mcp-request (jsonrpc-request "resources/read"
                                               {:uri "ui://metabase/visualize-query.html"} 1)
@@ -1482,12 +1646,38 @@
                              {"mcp-session-id" session-id})]
       (is (= 200 (:status read1)))
       (is (= 200 (:status read2)))
-      ;; Both responses should contain the same session token in the rendered HTML
+      ;; The resource is safe to cache because it contains only stable configuration.
       (let [html1 (-> (get-in read1 [:body :result :contents]) first :text)
             html2 (-> (get-in read2 [:body :result :contents]) first :text)]
         (is (some? html1))
-        (is (= html1 html2)
-            "Same embedding session should produce identical HTML output")))))
+        (is (not (str/includes? html1 "uiCredential")))
+        (is (not (str/includes? html2 "uiCredential")))
+        (is (not (str/includes? html1 "mcpSessionId")))
+        (is (not (str/includes? html2 "mcpSessionId")))
+        (is (not (str/includes? html1 "refreshTool")))
+        (is (not (str/includes? html2 "refreshTool")))))))
+
+(deftest mcp-ui-credential-validation-test
+  (testing "an app-only refresh tool provides the scoped UI request surface, but not general API access"
+    (mt/with-temporary-setting-values [site-url "http://localhost:3000"]
+      (t2/with-transaction [_conn nil {:rollback-only true}]
+        (oauth-server/reset-provider!)
+        (let [token       (str (random-uuid))
+              _           (save-access-token! token (mt/user->id :crowberto) #{"agent:viz:mcp-ui:query"})
+              initialize  (mcp-request-with-bearer token 200 (jsonrpc-request "initialize" {:capabilities mcp-app-ui-capabilities}) {})
+              session-id  (get-in initialize [:headers "Mcp-Session-Id"])
+              tool-result (mcp-request-with-bearer token 200
+                                                   (jsonrpc-request "tools/call"
+                                                                    {:name      "refresh_ui_credential"
+                                                                     :arguments {}})
+                                                   {"mcp-session-id" session-id})
+              credential  (get-in tool-result [:body :result :_meta :com.metabase/mcp-apps :credential])
+              headers     {"x-metabase-mcp-ui-auth" credential}]
+          (is (string? credential))
+          (is (= 200 (:status (client/client-full-response :get 200 "user/current"
+                                                           {:request-options {:headers headers}}))))
+          (is (= 401 (:status (client/client-full-response :get 401 "collection"
+                                                           {:request-options {:headers headers}})))))))))
 
 (deftest batch-initialized-then-resources-read-test
   (testing "batch containing notifications/initialized + resources/read succeeds"

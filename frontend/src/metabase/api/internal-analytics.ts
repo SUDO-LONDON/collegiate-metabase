@@ -1,4 +1,4 @@
-import api from "metabase/api/legacy-client";
+import { api } from "metabase/api/client";
 
 type InternalAnalyticsEvent = {
   op: "inc" | "dec" | "set" | "observe" | "clear";
@@ -7,8 +7,13 @@ type InternalAnalyticsEvent = {
   amount?: number;
 };
 
-export function postInternalAnalytics(
+export async function postInternalAnalytics(
   events: InternalAnalyticsEvent[],
 ): Promise<void> {
-  return api.POST("/api/analytics/internal")({ events });
+  await api.request({
+    method: "POST",
+    url: "/api/analytics/internal",
+    body: { events },
+    retry: true,
+  });
 }

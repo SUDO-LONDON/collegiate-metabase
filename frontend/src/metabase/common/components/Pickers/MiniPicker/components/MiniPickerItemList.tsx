@@ -12,7 +12,6 @@ import {
   useListDatabasesQuery,
   useSearchQuery,
 } from "metabase/api";
-import { canCollectionCardBeUsed } from "metabase/common/components/Pickers/utils";
 import { VirtualizedList } from "metabase/common/components/VirtualizedList";
 import { useSetting } from "metabase/common/hooks";
 import { useDebouncedValue } from "metabase/common/hooks/use-debounced-value";
@@ -32,6 +31,7 @@ import {
   Text,
   TextInput,
 } from "metabase/ui";
+import { isNamelessSchema } from "metabase-lib/v1/metadata/utils/schema";
 import type {
   CollectionItem,
   SchemaName,
@@ -157,7 +157,7 @@ function RootItemList() {
             setPath([
               {
                 model: "collection",
-                id: "root" as any, // cmon typescript, trust me
+                id: "root",
                 name: rootCollectionError ? t`Collections` : t`Our analytics`,
               },
             ]);
@@ -300,7 +300,7 @@ function DatabaseItemList({
         : skipToken,
     );
 
-  const dbId = parent.model === "database" ? parent.id : parent.database_id!;
+  const dbId = parent.model === "database" ? parent.id : parent.database_id;
 
   const schemas = allSchemas?.filter((schema) => {
     return !isHidden({
@@ -318,6 +318,21 @@ function DatabaseItemList({
         ? schemas[0] // if there's one schema, go straight to tables
         : null;
 
+  // Schema-less DBs (MySQL, Mongo, SQLite, …) report a single nameless schema.
+  // In that case, select the DB immediately instead of showing a blank row at 'schema' step.
+  const shouldAutoSelectNamelessSchema =
+    schemasArePickable &&
+    parent.model === "database" &&
+    schemas?.length === 1 &&
+    isNamelessSchema(schemas[0]);
+
+  useEffect(() => {
+    if (shouldAutoSelectNamelessSchema) {
+      setPath([]);
+      onChange({ model: "schema", id: "", database_id: dbId, name: "" });
+    }
+  }, [shouldAutoSelectNamelessSchema, onChange, setPath, dbId]);
+
   const { data: tablesData, isLoading: isLoadingTables } =
     useListDatabaseSchemaTablesQuery(
       schemaName !== null
@@ -329,7 +344,7 @@ function DatabaseItemList({
         : skipToken,
     );
 
-  if (isLoadingSchemas) {
+  if (isLoadingSchemas || shouldAutoSelectNamelessSchema) {
     return <MiniPickerListLoader />;
   }
 
@@ -408,11 +423,10 @@ function CollectionItemList({ parent }: { parent: MiniPickerCollectionItem }) {
 
   const { data, isLoading, isFetching } = useListCollectionItemsQuery({
     id: parent.sourceCollectionId ?? (parent.id === null ? "root" : parent.id),
-    include_can_run_adhoc_query: true,
   });
 
   const allItems: CollectionItem[] = (data?.data ?? []).filter(
-    (item) => canCollectionCardBeUsed(item) && !isHidden(item),
+    (item) => !isHidden(item),
   );
   const typeFilter = parent.childTypeFilter;
   const items = typeFilter
@@ -485,6 +499,7 @@ function SearchItemList({ query: externalQuery }: { query: string }) {
       q: query,
       models: models as SearchModel[],
       limit: 50,
+      context: "data-picker",
     };
     const extraParams =
       typeof searchParams === "function" ? searchParams(params) : searchParams;
@@ -588,7 +603,7 @@ export const MiniPickerListLoader = () => (
         height="1.5rem"
         width="100%"
         radius="0.5rem"
-        bg="background-secondary"
+        bg="background_page-secondary"
       />
     </Repeat>
   </Stack>

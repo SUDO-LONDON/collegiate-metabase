@@ -14,8 +14,11 @@
    [metabase-enterprise.data-complexity-score.init]
    [metabase-enterprise.database-replication.init]
    [metabase-enterprise.dependencies.init]
+   [metabase-enterprise.entity-retrieval.init]
    [metabase-enterprise.gsheets.init]
+   [metabase-enterprise.memoize-monitor.init]
    [metabase-enterprise.metabot.init]
+   [metabase-enterprise.mfa.init]
    [metabase-enterprise.remote-sync.init]
    [metabase-enterprise.scim.init]
    [metabase-enterprise.security-center.init]
@@ -24,5 +27,6 @@
    [metabase-enterprise.sso.init]
    [metabase-enterprise.stale.init]
    [metabase-enterprise.support-access-grants.init]
+   [metabase-enterprise.tenants.init]
    [metabase-enterprise.transforms-python.init]
    [metabase-enterprise.workspaces.init]))
