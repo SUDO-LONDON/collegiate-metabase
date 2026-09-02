@@ -4,16 +4,20 @@
    [buddy.sign.util :as buddy-util]
    [clojure.string :as str]
    [clojure.test :refer :all]
+   [honey.sql :as sql]
    [metabase-enterprise.sso.integrations.token-utils :as token-utils]
+   [metabase-enterprise.sso.providers.jwt :as providers.jwt]
    [metabase-enterprise.sso.settings :as sso-settings]
    [metabase-enterprise.sso.test-setup :as sso.test-setup]
    [metabase-enterprise.tenants.auth-provider] ;; make sure the auth provider is actually registered
    [metabase.appearance.settings :as appearance.settings]
+   [metabase.auth-identity.provider :as auth-identity.provider]
    [metabase.test :as mt]
    [metabase.test.fixtures :as fixtures]
    [metabase.test.http-client :as client]
    [metabase.util :as u]
    [metabase.util.malli.schema :as ms]
+   [methodical.core :as methodical]
    [toucan2.core :as t2]))
 
 (use-fixtures :once (fixtures/initialize :test-users))
@@ -139,6 +143,41 @@
                                                         :redirect default-redirect-uri)
               redirect-url (get-in result [:headers "Location"])]
           (is (str/includes? redirect-url "&return_to=")))))))
+
+(deftest login!-ignores-caller-supplied-user-id-real-jwt-provider-test
+  (testing (str "A caller-supplied :user-id must not name the account, even on a successful JWT login. "
+                "JWT's authenticate resolves identity from :user-data and returns no :user-id of its own, "
+                "so an injected one survives the merge and wins resolution, which reads it before the email "
+                "branch. Drives login! directly rather than /auth/sso because the exposure is a key at the "
+                "request root: the integrations forward the whole Ring request, while Ring namespaces params "
+                "under :params, so an HTTP-level injection never reaches the root and would assert nothing.")
+    (with-jwt-default-setup!
+      (mt/with-temp [:model/User {admin-id :id} {:is_active true, :is_superuser true}]
+        (mt/with-model-cleanup [:model/User]
+          (let [victim-email "jwt-victim@metabase.com"
+                token        (jwt/sign {:email      victim-email
+                                        :first_name "Jay"
+                                        :last_name  "Doubleyou"}
+                                       default-jwt-secret)
+                result       (auth-identity.provider/login!
+                              :provider/jwt
+                              {:token       token
+                               ;; the injection: names an admin the JWT says nothing about
+                               :user-id     admin-id
+                               :device-info {:device_id          "test-device"
+                                             :device_description "Test Browser"
+                                             :ip_address         "127.0.0.1"
+                                             :embedded           false
+                                             :token_exchange     false}})
+                resolved-id  (get-in result [:user :id])]
+            (is (true? (:success? result))
+                "the JWT is valid, so authentication genuinely succeeds")
+            (is (= victim-email (t2/select-one-fn :email :model/User :id resolved-id))
+                "the account logged into is the one the JWT asserted")
+            (is (not= admin-id resolved-id)
+                "the caller-supplied :user-id must not name the account")
+            (is (zero? (t2/count :model/Session :user_id admin-id))
+                "and no session may be minted for the injected admin")))))))
 
 (deftest jwt-saml-both-enabled-test
   (with-jwt-default-setup!
@@ -472,6 +511,31 @@
                                      (u/the-id (t2/select-one-pk :model/User :email "newuser@metabase.com")))
                                     "admins")))))))))))
 
+(deftest group-names->ids-no-mappings-input-validation-test
+  (testing "with no mappings, group names are matched by exact value"
+    (mt/with-temporary-setting-values [jwt-group-mappings nil]
+      (let [captured (atom nil)]
+        (with-redefs [t2/select-pks-set (fn [_model _col in-clause]
+                                          (reset! captured (second in-clause))
+                                          #{})]
+          (testing "a string group name is bound as a parameter"
+            (#'providers.jwt/group-names->ids ["developers"])
+            (let [[query & params] (sql/format {:select [:id]
+                                                :from   [:permissions_group]
+                                                :where  [:in :name @captured]})]
+              (is (str/includes? query "IN (?)"))
+              (is (= ["developers"] params))))
+          (testing "non-string group names are ignored"
+            (reset! captured nil)
+            (#'providers.jwt/group-names->ids ["developers" {:select :x}])
+            (is (= #{"developers"} @captured))
+            (let [[query & params] (sql/format {:select [:id]
+                                                :from   [:permissions_group]
+                                                :where  [:in :name @captured]})]
+              (is (str/includes? query "IN (?)"))
+              (is (= ["developers"] params))
+              (is (not (str/includes? query "select"))))))))))
+
 (deftest login-as-existing-user-test
   (testing "login as an existing user works"
     (testing "An existing user will be reactivated upon login"
@@ -535,6 +599,32 @@
             (testing "login attributes remain unchanged from initial login"
               (is (= nil
                      (t2/select-one-fn :login_attributes :model/User :email "existinguser@metabase.com"))))))))))
+
+(deftest reactivating-login-does-not-restore-superuser-test
+  (testing "SSO reactivating a deactivated admin must not hand back their admin rights"
+    (with-jwt-default-setup!
+      (mt/with-model-cleanup [:model/User]
+        (let [email "offboarded@metabase.com"
+              sign  #(jwt/sign {:email email :first_name "Off" :last_name "Boarded"} default-jwt-secret)
+              login #(client/client-real-response :get 302 "/auth/sso"
+                                                  {:request-options {:redirect-strategy :none}}
+                                                  :return_to default-redirect-uri
+                                                  :jwt (sign))]
+          (is (sso.test-setup/successful-login? (login)))
+          (t2/update! :model/User :email email {:is_superuser true})
+          (t2/update! :model/User :email email {:is_active false})
+          (is (=? {:is_active false, :is_superuser true}
+                  (t2/select-one [:model/User :is_active :is_superuser] :email email))
+              "deactivation leaves the admin flag alone, which is what makes this reachable")
+          (testing "a valid assertion still reopens the account, but not as an admin"
+            (is (sso.test-setup/successful-login? (login)))
+            (is (=? {:is_active true, :is_superuser false}
+                    (t2/select-one [:model/User :is_active :is_superuser] :email email))))
+          (testing "an admin who was never deactivated keeps their rights when they log in"
+            (t2/update! :model/User :email email {:is_superuser true})
+            (is (sso.test-setup/successful-login? (login)))
+            (is (=? {:is_active true, :is_superuser true}
+                    (t2/select-one [:model/User :is_active :is_superuser] :email email)))))))))
 
 (deftest login-update-account-test
   (testing "An existing user will be reactivated upon login"
@@ -950,8 +1040,8 @@
                     "array_attr" "item1,item2"}
                    (t2/select-one-fn :jwt_attributes :model/User :email "rasta@metabase.com"))))
           (testing "warning messages are logged for non-stringable values"
-            (is (some #(re-find #"Dropping attribute 'object_attr' with non-stringable value: \{:nested \"value\"\}" %) (map :message (jwt-log-messages))))
-            (is (some #(re-find #"Dropping attribute 'null_attr' with non-stringable value: null" %) (map :message (jwt-log-messages)))))
+            (is (some #(re-find #"Dropping attribute 'object_attr' with non-stringable value" %) (map :message (jwt-log-messages))))
+            (is (some #(re-find #"Dropping attribute 'null_attr' with non-stringable value" %) (map :message (jwt-log-messages)))))
           (testing "warning messages are logged for `@`-prefixed keys"
             (is (some #(re-find #"Dropping attribute '@attribute', keys beginning with `@` are reserved" %) (map :message (jwt-log-messages)))))
           (testing "no warning for valid string attribute"
@@ -1103,6 +1193,75 @@
                       (is (contains? (group-memberships (u/the-id user)) "Tenant Engineers")))
                     (testing "user is assigned to All tenant users (magic group for tenant users)"
                       (is (contains? (group-memberships (u/the-id user)) "All tenant users")))))))))))))
+
+(deftest jwt-with-valid-tenant-claim-must-never-create-wedged-internal-user-test
+  (testing (str "UXW-4898: if the tenant login step is missing from the login! method chain (as happens when "
+                "metabase-enterprise.tenants.auth-provider was never loaded — see metabase-enterprise.tenants.init), "
+                "a JWT carrying a valid @tenant plus a mapped tenant group must NOT succeed and silently create an "
+                "internal user, which would permanently wedge the account. It must fail loudly and leave no user row.")
+    (with-jwt-default-setup!
+      (mt/with-additional-premium-features #{:tenants}
+        (mt/with-temporary-setting-values [use-tenants true]
+          (mt/with-temp [:model/Tenant _ {:slug "tenant-mctenantson"
+                                          :name "Tenant McTenantson"}
+                         :model/PermissionsGroup {tenant-group-id :id} {:name "Tenant Administrators"
+                                                                        :is_tenant_group true}]
+            (mt/with-temporary-setting-values
+              [jwt-group-sync true
+               jwt-group-mappings {"Tenant Administrators" [tenant-group-id]}
+               jwt-attribute-groups "groups"]
+              (mt/with-model-cleanup [:model/User]
+                (let [dispatch-val :metabase-enterprise.tenants.auth-provider/create-tenant-if-not-exists
+                      method       (methodical/primary-method auth-identity.provider/login! dispatch-val)]
+                  (is (some? method)
+                      "tenant login method should be registered at startup (see metabase-enterprise.tenants.init)")
+                  (try
+                    (alter-var-root #'auth-identity.provider/login! methodical/remove-primary-method dispatch-val)
+                    (let [response (client/client-real-response :get 400 "/auth/sso"
+                                                                {:request-options {:redirect-strategy :none}}
+                                                                :return_to default-redirect-uri
+                                                                :jwt
+                                                                (jwt/sign
+                                                                 {:email "wedgeduser@metabase.com"
+                                                                  :first_name "Wedged"
+                                                                  :last_name "User"
+                                                                  "@tenant" "tenant-mctenantson"
+                                                                  :groups ["Tenant Administrators"]}
+                                                                 default-jwt-secret))]
+                      (is (not (sso.test-setup/successful-login? response)))
+                      (testing "no half-provisioned user row is left behind"
+                        (is (nil? (t2/select-one :model/User :email "wedgeduser@metabase.com")))))
+                    (finally
+                      (alter-var-root #'auth-identity.provider/login!
+                                      methodical/add-primary-method dispatch-val method))))))))))))
+
+(deftest jwt-without-tenant-claim-mapped-to-tenant-group-fails-loudly-test
+  (testing (str "a JWT with no @tenant claim whose groups map to a tenant group must not succeed "
+                "and silently create an internal user with a swallowed group-sync failure. The tenant-group "
+                "mismatch must fail the login and roll back user creation.")
+    (with-jwt-default-setup!
+      (mt/with-additional-premium-features #{:tenants}
+        (mt/with-temporary-setting-values [use-tenants true]
+          (mt/with-temp [:model/PermissionsGroup {tenant-group-id :id} {:name "Tenant Administrators"
+                                                                        :is_tenant_group true}]
+            (mt/with-temporary-setting-values
+              [jwt-group-sync true
+               jwt-group-mappings {"Tenant Administrators" [tenant-group-id]}
+               jwt-attribute-groups "groups"]
+              (mt/with-model-cleanup [:model/User]
+                (let [response (client/client-real-response :get 400 "/auth/sso"
+                                                            {:request-options {:redirect-strategy :none}}
+                                                            :return_to default-redirect-uri
+                                                            :jwt
+                                                            (jwt/sign
+                                                             {:email "tenantless@metabase.com"
+                                                              :first_name "Tenantless"
+                                                              :last_name "User"
+                                                              :groups ["Tenant Administrators"]}
+                                                             default-jwt-secret))]
+                  (is (not (sso.test-setup/successful-login? response)))
+                  (testing "user creation is rolled back"
+                    (is (nil? (t2/select-one :model/User :email "tenantless@metabase.com")))))))))))))
 
 (deftest tenant-user-assigned-to-tenant-group-via-name-matching-test
   (testing "JWT user with tenant claim can be assigned to tenant user groups via group name matching (no explicit mappings)"

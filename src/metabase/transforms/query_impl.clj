@@ -4,6 +4,7 @@
    [metabase.driver :as driver]
    [metabase.driver.connection :as driver.conn]
    [metabase.premium-features.core :refer [defenterprise]]
+   [metabase.request.core :as request]
    [metabase.tracing.core :as tracing]
    [metabase.transforms-base.interface :as transforms-base.i]
    [metabase.transforms-base.util :as transforms-base.u]
@@ -32,7 +33,7 @@
 (defn- run-mbql-transform!
   ([transform] (run-mbql-transform! transform nil))
   ([{:keys [id source target owner_user_id creator_id] :as transform}
-    {:keys [run-method start-promise user-id]}]
+    {:keys [run-method on-start user-id job-run-id]}]
    ;; `:target` is already workspace-rewritten — `resolve-transform-target` runs in
    ;; `metabase.transforms.execute/execute!` before dispatch.
    (try
@@ -42,16 +43,23 @@
            run-user-id (if (and (= run-method :manual) user-id)
                          user-id
                          (or owner_user_id creator_id))
-           {run-id :id} (transforms.u/try-start-unless-already-running id run-method run-user-id)]
-       (when start-promise (deliver start-promise [:started run-id]))
+           ;; Authorized as the user the run executes as -- the requester for a manual run, the owner (or
+           ;; creator) otherwise -- and before the run row is booked. A manual refusal surfaces as a 403 on
+           ;; the request that asked for the run rather than as a failed run.
+           _           (do (when-not run-user-id
+                             (throw (ex-info "Transform has no owner or creator to run as" {:transform-id id})))
+                           (request/with-current-user run-user-id
+                             (transforms.u/check-source-query-permissions! transform)))
+           {run-id :id} (transforms.u/try-start-unless-already-running id run-method run-user-id :job-run-id job-run-id)]
+       (when on-start (on-start run-id))
        (driver.conn/with-write-connection
          (log/info "Executing transform" id "with target" (pr-str target)
-                   (when (driver.conn/write-connection-requested?) " using write connection"))
+                   "using" (driver.conn/connection-telemetry-info))
          (let [target-type (keyword (:type target))]
            (tracing/with-span :tasks "task.transform.query"
              {:transform/id                   id
               :transform/target-type          (name target-type)
-              :transform/incremental          (= :table-incremental target-type)
+              :transform/incremental          (transforms-base.u/incremental-target? transform)
               :transform/full-incremental-run (transforms-base.u/full-incremental-run? transform)
               :db/id                          (:id db)
               :db/engine                      (name driver)}
@@ -79,11 +87,7 @@
      (catch Throwable t
        (if (= :already-running (:error (ex-data t)))
          (log/warnf "Transform %d is already running" id)
-         (log/error t "Error executing transform"))
-       (when start-promise
-         ;; if the start-promise has been delivered, this is a no-op,
-         ;; but we assume nobody would catch the exception anyway
-         (deliver start-promise t))
+         (log/errorf "Error executing transform: %s" (ex-message t)))
        (throw t)))))
 
 #_{:clj-kondo/ignore [:discouraged-var]}

@@ -740,10 +740,13 @@
         ;; root collection is nil
         [collection]))
     (let [personal-collection-ids (t2/select-pks-set :model/Collection :personal_owner_id [:not= nil])
+          ;; Personal Collections only ever live in the Root Collection, so a Collection is inside one exactly when
+          ;; the first ID of its location path is a Personal Collection. Testing that ID against the set beats
+          ;; scanning every personal collection per row: instances with thousands of each made this quadratic.
           location-is-personal    (fn [location]
                                     (boolean
                                      (and (string? location)
-                                          (some #(str/starts-with? location (format "/%d/" %)) personal-collection-ids))))]
+                                          (personal-collection-ids (first (location-path->ids location))))))]
       (map (fn [{:keys [location personal_owner_id] :as coll}]
              (if (some? coll)
                (assoc coll :is_personal (or (some? personal_owner_id)
@@ -761,12 +764,6 @@
 ;; For example, if a Collection has a `location` of `/10/20/30/`, and the current User is allowed to see Collections
 ;; 10 and 30, but not 20, we will show them an "effective" location path of `/10/30/`. This is used for things like
 ;; breadcrumbing in the frontend.
-
-(def ^:private VisibleCollections
-  "Includes the possible values for visible collections, possibly including `\"root\"` to represent the root
-  collection."
-  [:set
-   [:or [:= "root"] ms/PositiveInt]])
 
 (def ^:private CollectionVisibilityConfig
   [:map
@@ -860,6 +857,7 @@
    ;; - archive operation id (when we archive a collection and subcollections together, we mark the whole archived
    ;;   tree so you can look at it in isolation)
    ;; - effective child (if you're only interested in things that are an effective child of another collection, we can do that)
+   ^:allow-subquery
    {:select :id
     ;; the `FROM` clause is where we limit the collections to the ones we have permissions on. For a superuser,
     ;; that's all of them. For regular users, it's:
@@ -868,35 +866,42 @@
     ;; c) their personal collection and its descendants
     :from [(if is-superuser?
              [:collection :c]
-             [{:union-all (keep identity [{:select visible-union-columns
+             [^:allow-subquery
+              {:union-all (keep identity [^:allow-subquery
+                                          {:select visible-union-columns
                                            :from   [[:collection :c]]
-                                           :where [:and [:exists {:select [1]
-                                                                  :from [[:permissions :p]]
-                                                                  :inner-join [[:permissions_group_membership :pgm] [:= :p.group_id :pgm.group_id]]
-                                                                  :where [:and
-                                                                          [:= :pgm.user_id [:inline current-user-id]]
-                                                                          [:= :c.id :p.collection_id]
-                                                                          [:= :p.perm_type (h2x/literal "perms/collection-access")]
-                                                                          [:or
-                                                                           [:= :p.perm_value (h2x/literal "read-and-write")]
-                                                                           (when (= :read (:permission-level visibility-config))
-                                                                             [:= :p.perm_value (h2x/literal "read")])]]}]]}
+                                           :where [:and [:exists ^:allow-subquery
+                                                         {:select [1]
+                                                          :from [[:permissions :p]]
+                                                          :inner-join [[:permissions_group_membership :pgm] [:= :p.group_id :pgm.group_id]]
+                                                          :where [:and
+                                                                  [:= :pgm.user_id [:inline current-user-id]]
+                                                                  [:= :c.id :p.collection_id]
+                                                                  [:= :p.perm_type (h2x/literal "perms/collection-access")]
+                                                                  [:or
+                                                                   [:= :p.perm_value (h2x/literal "read-and-write")]
+                                                                   (when (= :read (:permission-level visibility-config))
+                                                                     [:= :p.perm_value (h2x/literal "read")])]]}]]}
+                                          ^:allow-subquery
                                           {:select visible-union-columns
                                            :from   [[:collection :c]]
                                            :where  [:= :type (h2x/literal trash-collection-type)]}
                                           (when-let [personal-collection-and-descendant-ids
                                                      (seq (user->personal-collection-and-descendant-ids current-user-id))]
+                                            ^:allow-subquery
                                             {:select visible-union-columns
                                              :from   [[:collection :c]]
                                              :where  [:in :id [:inline personal-collection-and-descendant-ids]]})
                                           (when-let [tenant-collection-and-descendant-ids (seq (perms/user->tenant-collection-and-descendant-ids current-user-id))]
+                                            ^:allow-subquery
                                             {:select visible-union-columns
                                              :from [[:collection :c]]
                                              :where [:in :id [:inline tenant-collection-and-descendant-ids]]})
                                           (when (perms/is-data-analyst? current-user-id)
+                                            ^:allow-subquery
                                             {:select visible-union-columns
                                              :from [[:collection :c]]
-                                             :where [:= :namespace [:inline "transforms"]]})])}
+                                             :where [:= :namespace ^:allow-raw-sql [:inline "transforms"]]})])}
               :c])]
     ;; The `WHERE` clause is where we apply the other criteria we were given:
     :where [:and
@@ -913,14 +918,15 @@
                ;; the trash collection is included when viewing archived-only
                [:= :id [:inline (trash-collection-id)]]])
             (when-not (perms/use-tenants)
-              [:not [:exists {:select [1]
-                              :from [[:collection :sub_c]]
-                              :where [:and [:= :c.id :sub_c.id]
-                                      [:= :sub_c.namespace [:inline "shared-tenant-collection"]]]}]])
+              [:not [:exists ^:allow-subquery
+                     {:select [1]
+                      :from [[:collection :sub_c]]
+                      :where [:and [:= :c.id :sub_c.id]
+                              [:= :sub_c.namespace ^:allow-raw-sql [:inline "shared-tenant-collection"]]]}]])
             ;; excluding things outside of the `archive_operation_id` you wanted...
             (when-let [op-id (:archive-operation-id visibility-config)]
               [:or
-               [:= :c.archive_operation_id [:inline op-id]]
+               [:= :c.archive_operation_id op-id]
                ;; the trash collection is part of every `archive_operation`
                [:= :id (trash-collection-id)]])]}))
 
@@ -949,7 +955,7 @@
       [:in
        collection-id-field
        (if cte-name
-         {:select :id :from cte-name}
+         ^:allow-subquery {:select :id :from cte-name}
          (visible-collection-query visibility-config user-scope))]])))
 
 (defn- effective-child-of-filter-clause
@@ -966,55 +972,54 @@
         ;; an effective child is a descendant of the parent collection
         [:like (->col "location") (str (children-location parent-coll) "%")]
         ;; but NOT a child of any OTHER visible collection.
-        [:not [:exists {:select 1
-                        :from [[:collection :c2]]
-                        :where [:and
-                                (visible-collection-filter-clause :c2.id visibility-config)
-                                [:= (->col "location") [:concat :c2.location :c2.id (h2x/literal "/")]]
-                                (when-not (collection.root/is-root-collection? parent-coll)
-                                  [:not= :c2.id [:inline (u/the-id parent-coll)]])]}]]])]))
+        [:not [:exists ^:allow-subquery
+               {:select 1
+                :from [[:collection :c2]]
+                :where [:and
+                        (visible-collection-filter-clause :c2.id visibility-config)
+                        [:= (->col "location") [:concat :c2.location :c2.id (h2x/literal "/")]]
+                        (when-not (collection.root/is-root-collection? parent-coll)
+                          [:not= :c2.id [:inline (u/the-id parent-coll)]])]}]]])]))
 
-(def ^{:arglists '([visibility-config])} visible-collection-ids*
-  "Impl for `visible-collection-ids`, caches for the lifetime of the request, maximum 10 seconds."
-  (memoize/ttl
-   ^{::memoize/args-fn (fn [[visibility-config]]
-                         (if-let [req-id *request-id*]
-                           [req-id api/*current-user-id* visibility-config]
-                           [(random-uuid) api/*current-user-id* visibility-config]))}
-   (fn
-     [visibility-config]
-     (cond-> (t2/select-pks-set :model/Collection {:where (visible-collection-filter-clause :id visibility-config)})
-       (should-display-root-collection? visibility-config)
-       (conj "root")))
-   ;; cache the results for 60 minutes; TTL is here only to eventually clear out old entries/keep it from growing too
-   ;; large
-   :ttl/threshold (* 60 60 1000)))
+(defn visible-collection-id?
+  "Whether the current user can see the Collection with `collection-id`, at `:read` (the default) or `:write` level.
 
-(mu/defn visible-collection-ids :- VisibleCollections
-  "Returns all collection IDs that are visible given the `visibility-config` passed in. (Config provides knobs for
-  toggling permission level, trash/archive visibility, etc). If you're trying to filter based on this, you should
-  probably use `visible-collection-filter-clause` instead."
-  [visibility-config :- CollectionVisibilityConfig]
-  (visible-collection-ids* visibility-config))
+  Answered from the current user's permission set rather than by listing every visible Collection, so it costs no
+  query. Note that it answers only the permission question: unlike [[visible-collection-query]] it applies no archival
+  filtering, and no `shared-tenant-collection` exclusion for instances with tenants disabled. Callers that need those
+  must say so themselves.
+
+  That is safe for the ancestors and descendants this is used on, because a collection tree never spans namespaces
+  (see `assert-valid-namespace`): they sit in the namespace of a collection the caller already holds, and so were
+  subject to the same filtering when the caller obtained it. Use [[visible-collection-filter-clause]] to filter
+  *inside* a query."
+  ([collection-id]
+   (visible-collection-id? collection-id :read))
+
+  ([collection-id permission-level]
+   (boolean
+    (or
+     (= collection-id (trash-collection-id))
+     (perms/set-has-full-permissions? @api/*current-user-permissions-set*
+                                      (case permission-level
+                                        :read  (perms/collection-read-path collection-id)
+                                        :write (perms/collection-readwrite-path collection-id)))))))
 
 (mi/define-batched-hydration-method effective-location-path*
   :effective_location
   "Given a seq of `collections`, batch hydrates them with their effective location."
   [collections]
   (when (seq collections)
-    (let [collection-ids (visible-collection-ids {:include-archived-items :all
-                                                  :include-trash-collection? true})]
-      (for [collection collections]
-        (when (some? collection)
-          (assoc collection
-                 :effective_location
-                 (when-not (collection.root/is-root-collection? collection)
-                   (let [real-location-path (if (:archived_directly collection)
-                                              (trash-path)
-                                              (:location collection))]
-                     (apply location-path (for [id    (location-path->ids real-location-path)
-                                                :when (contains? collection-ids id)]
-                                            id))))))))))
+    (for [collection collections]
+      (when (some? collection)
+        (assoc collection
+               :effective_location
+               (when-not (collection.root/is-root-collection? collection)
+                 (let [real-location-path (if (:archived_directly collection)
+                                            (trash-path)
+                                            (:location collection))]
+                   (apply location-path (filter visible-collection-id?
+                                                (location-path->ids real-location-path))))))))))
 
 (defn effective-location-path
   "Given a collection, returns the effective location (hiding parts of the path that the current user doesn't have access to)."
@@ -1028,7 +1033,7 @@
 
 (defn- effective-parent-root []
   (select-keys
-   (collection.root/root-collection-with-ui-details {})
+   (collection.root/root-collection-with-ui-details nil)
    effective-parent-fields))
 
 (mi/define-batched-hydration-method effective-parent
@@ -1221,6 +1226,7 @@
   [collection :- CollectionWithLocationAndIDOrRoot
    visibility-config :- CollectionVisibilityConfig
    & additional-honeysql-where-clauses]
+  ^:allow-subquery
   {:select [:id :name :description :type]
    :from   [[:collection :col]]
    :where  (apply effective-children-where-clause collection :col visibility-config additional-honeysql-where-clauses)})
@@ -1445,7 +1451,8 @@
     (let [{collection-after-update :collection_id :as model-after-update} <>]
       (when (remote-synced-collection? collection-after-update)
         (check-non-remote-synced-dependencies model-after-update)
-        (when (api/column-will-change? :archived model-before-update model-after-update)
+        (when (and (api/column-will-change? :archived model-before-update model-after-update)
+                   (:archived model-after-update))
           (check-remote-synced-dependents model-after-update)))
       (when (and (api/column-will-change? :collection_id model-before-update model-after-update)
                  (moving-from-remote-synced? collection-before-update collection-after-update))
@@ -1592,6 +1599,13 @@
   `(binding [*allow-modifying-tenant-root-collections?* true]
      (do ~@body)))
 
+(defenterprise unpublish-downstream-fk-tables!
+  "When Library tables are unpublished because their collection is archived or deleted, also unpublish any tables that
+  depend on them via FK remapping (Dimensions) so implicit joins are not broken. OSS no-op."
+  metabase-enterprise.data-studio.api.table
+  [_seed-table-ids]
+  nil)
+
 (mu/defn archive-collection!
   "Mark a collection as archived, along with all its children."
   [collection :- CollectionWithLocationAndIDOrRoot]
@@ -1630,9 +1644,13 @@
                                                 :id   [:in affected-collection-ids]
                                                 :type library-data-collection-type)]
         (when (seq library-data-ids)
-          (t2/update! :model/Table {:collection_id [:in library-data-ids]}
-                      {:collection_id nil
-                       :is_published  false}))))
+          (let [published-table-ids (t2/select-pks-set :model/Table
+                                                       :collection_id [:in library-data-ids]
+                                                       :is_published  true)]
+            (t2/update! :model/Table {:collection_id [:in library-data-ids]}
+                        {:collection_id nil
+                         :is_published  false})
+            (unpublish-downstream-fk-tables! published-table-ids)))))
     (let [updated-collection (t2/select-one :model/Collection :id (:id collection))]
       (when (:is_remote_synced updated-collection)
         (check-remote-synced-dependents updated-collection)))))
@@ -1999,9 +2017,13 @@
     (throw (ex-info "Fatal error: the trash collection cannot be trashed" {})))
   ;; delete all collection children
   (t2/delete! :model/Collection :location (children-location collection))
-  (let [affected-collection-ids (cons (u/the-id collection) (collection->descendant-ids collection))]
+  (let [affected-collection-ids (cons (u/the-id collection) (collection->descendant-ids collection))
+        published-table-ids     (t2/select-pks-set :model/Table
+                                                   :collection_id [:in affected-collection-ids]
+                                                   :is_published  true)]
     (t2/update! :model/Table :collection_id [:in affected-collection-ids] {:collection_id nil
                                                                            :is_published  false})
+    (unpublish-downstream-fk-tables! published-table-ids)
     (doseq [model [:model/Card
                    :model/Dashboard
                    :model/NativeQuerySnippet
@@ -2045,10 +2067,10 @@
     [:and
      [:or [:= (maybe-alias :type) nil]
       [:and
-       [:not= (maybe-alias :type) [:inline instance-analytics-collection-type]]
-       [:not= (maybe-alias :type) [:inline trash-collection-type]]]]
+       [:not= (maybe-alias :type) instance-analytics-collection-type]
+       [:not= (maybe-alias :type) trash-collection-type]]]
      [:or [:= (maybe-alias :namespace) nil]
-      [:not= (maybe-alias :namespace) [:inline "analytics"]]]
+      [:not= (maybe-alias :namespace) ^:allow-raw-sql [:inline "analytics"]]]
      [:not (maybe-alias :is_sample)]]))
 
 (defn- parent-identity-hash [coll]

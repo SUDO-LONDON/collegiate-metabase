@@ -28,6 +28,10 @@
   the result is a Clojure map matching the external (keyword-keyed) shape, ready for JSON
   encoding or for handing back to the LLM as the canonical MBQL 5 representation."
   (:require
+   [clojure.walk :as walk]
+   [metabase.lib.metadata :as lib.metadata]
+   [metabase.lib.metadata.calculation :as lib.metadata.calculation]
+   [metabase.lib.metadata.protocols :as lib.metadata.protocols]
    [metabase.lib.normalize :as lib.normalize]
    [metabase.lib.schema :as lib.schema]
    [metabase.models.serialization.resolve :as resolve]
@@ -69,6 +73,57 @@
 ;;; Step 2+3 - resolve FKs and normalize
 ;;; ============================================================
 
+(defn- annotate-field-types
+  "Walk a normalized pMBQL query and stamp `:base-type` / `:effective-type` on every
+  `[:field opts field-id]` clause whose integer `field-id` is known to `metadata-provider`
+  but whose `opts` map is missing `:base-type`.
+
+  `lib.normalize` does not inject type info from the metadata provider — it performs only
+  structural normalization. This pass fills the gap so the returned query is fully annotated
+  and safe for the QP, `lib/returned-columns`, and downstream chart construction.
+
+  Idempotent: clauses that already carry `:base-type` are left unchanged."
+  [pmbql-query metadata-provider]
+  (walk/postwalk
+   (fn [node]
+     (if (and (vector? node)
+              (= :field (nth node 0 nil))
+              (map? (nth node 1 nil))
+              (pos-int? (nth node 2 nil))
+              (not (contains? (nth node 1) :base-type)))
+       (let [field (lib.metadata.protocols/field metadata-provider (nth node 2))]
+         (if (:base-type field)
+           (update node 1 (fn [opts]
+                            (cond-> (assoc opts :base-type (:base-type field))
+                              (:effective-type field)
+                              (assoc :effective-type (:effective-type field)))))
+           node))
+       node))
+   pmbql-query))
+
+(defn- annotate-metric-and-measure-ref-types
+  "BOT-1901: Stamp `:effective-type` on `:metric` / `:measure` refs missing it, computed
+  from the metric's / measure's aggregation definition — mirroring the FE's `lib.ref/ref-method
+  :metadata/metric`. Untyped refs poison arithmetic type inference in
+  [[metabase.agent-lib.representations.repair/assert-editor-accepts-expressions!]]"
+  [pmbql-query]
+  (walk/postwalk
+   (fn [node]
+     (if (and (vector? node)
+              (#{:metric :measure} (nth node 0 nil))
+              (map? (nth node 1 nil))
+              (pos-int? (nth node 2 nil))
+              (not (contains? (nth node 1) :effective-type)))
+       (let [md (case (nth node 0)
+                  :metric  (lib.metadata/metric pmbql-query (nth node 2))
+                  :measure (lib.metadata/measure pmbql-query (nth node 2)))
+             t  (when md (lib.metadata.calculation/type-of pmbql-query md))]
+         (if (and t (isa? t :type/*) (not= t :type/*))
+           (update node 1 assoc :effective-type t)
+           node))
+       node))
+   pmbql-query))
+
 (defn resolve-query
   "Convert a parsed (string-keyed, portable) representations query into a canonical, numeric-ID,
   `:lib/uuid`-stamped MBQL 5 query attached to `metadata-provider`.
@@ -86,7 +141,9 @@
          resolver (resolve.mp/import-resolver metadata-provider content-store)
          resolved (resolve/import-mbql resolver kw-form)
          with-mp  (assoc resolved :lib/metadata metadata-provider)]
-     (lib.normalize/normalize ::lib.schema/query with-mp))))
+     (-> (lib.normalize/normalize ::lib.schema/query with-mp)
+         (annotate-field-types metadata-provider)
+         annotate-metric-and-measure-ref-types))))
 
 ;;; ============================================================
 ;;; Export final pMBQL back to portable representations
@@ -157,5 +214,5 @@
      (try
        (export-query metadata-provider pmbql-query content-store)
        (catch Exception e
-         (log/warn e "Failed to export pMBQL query to portable representations; omitting from LLM payload")
+         (log/warnf "Failed to export pMBQL query to portable representations; omitting from LLM payload: %s" (ex-message e))
          nil)))))

@@ -5,6 +5,7 @@
    [metabase.analytics.core :as analytics.core]
    [metabase.lib-be.core :as lib-be]
    [metabase.search.config :as search.config]
+   [metabase.search.debug :as search.debug]
    [metabase.search.engine :as search.engine]
    [metabase.search.impl :as search.impl]
    [metabase.search.ingestion :as search.ingestion]
@@ -25,6 +26,8 @@
 (p/import-vars
  [search.config
   SearchableModel]
+ [search.debug
+  diagnose]
  [search.engine
   model-set]
  [search.impl
@@ -37,6 +40,7 @@
   searchable-value-trim-sql]
  [search.spec
   spec
+  specifications
   define-spec]
  [search.util
   collapse-id
@@ -80,7 +84,10 @@
 
 (defmethod analytics.core/initial-value :metabase-search/engine-active
   [_ {:keys [engine]}]
-  (if (search.engine/supported-engine? (keyword "search.engine" engine)) 1 0))
+  ;; Can the engine serve queries: in-place always can, indexed engines only while their index is maintained.
+  (if (= :ok (search.engine/engine-status (keyword "search.engine" engine)))
+    1
+    0))
 
 (defn supports-index?
   "Does this instance support a search index, of any sort?"
@@ -90,7 +97,8 @@
 (defn init-index!
   "Ensure there is an index ready to be populated."
   [& {:as opts}]
-  (when (supports-index?)
+  (search.engine/log-resolution!)
+  (when-let [engines (seq (search.engine/active-engines))]
     (log/info "Initializing search indexes")
     (tracing/with-span :search "search.init-index" {}
       (lib-be/with-metadata-provider-cache
@@ -99,7 +107,7 @@
           (let [timer    (u/start-timer)
                 report   (reduce (partial merge-with max)
                                  nil
-                                 (for [e (search.engine/active-engines)]
+                                 (for [e engines]
                                    (search.engine/init! e opts)))
                 duration (u/since-ms timer)]
             (if (seq report)
@@ -116,7 +124,7 @@
             (throw e)))))))
 
 (defn- reindex-logic! [opts]
-  (when (supports-index?)
+  (when-let [engines (seq (search.engine/active-engines))]
     (tracing/with-span :search "search.reindex" {}
       (lib-be/with-metadata-provider-cache
         (try
@@ -124,7 +132,7 @@
           (let [timer    (u/start-timer)
                 report   (reduce (partial merge-with max)
                                  nil
-                                 (for [e (search.engine/active-engines)]
+                                 (for [e engines]
                                    (search.engine/reindex! e opts)))
                 duration (u/since-ms timer)]
             (analytics/inc! :metabase-search/index-reindex-ms duration)
@@ -147,7 +155,7 @@
             (try
               (reindex-logic! opts)
               (catch Exception e
-                (log/error e "Reindex failed")
+                (log/errorf "Reindex failed: %s" (ex-message e))
                 (analytics/inc! :metabase-search/index-error)
                 (throw e))))]
     (if (or search.ingestion/*force-sync* (not async?))

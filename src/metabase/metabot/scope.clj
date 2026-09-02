@@ -17,6 +17,8 @@
 ;;; ──────────────────────────────────────────────────────────────────
 
 ;; SQL
+(api-scope/defscope agent-sql-construct "agent:sql:construct"
+  (deferred-tru "Construct SQL queries"))
 (api-scope/defscope agent-sql-create "agent:sql:create"
   (deferred-tru "Create SQL queries"))
 (api-scope/defscope agent-sql-edit "agent:sql:edit"
@@ -39,6 +41,14 @@
   (deferred-tru "Create saved questions"))
 (api-scope/defscope agent-question-update "agent:question:update"
   (deferred-tru "Update saved questions"))
+(api-scope/defscope agent-question-execute "agent:question:execute"
+  (deferred-tru "Run saved questions"))
+
+;; Metric (saved metric cards via Agent API)
+(api-scope/defscope agent-metric-create "agent:metric:create"
+  (deferred-tru "Create metrics"))
+(api-scope/defscope agent-metric-update "agent:metric:update"
+  (deferred-tru "Update metrics"))
 
 ;; Transforms
 (api-scope/defscope agent-transforms-read "agent:transforms:read"
@@ -147,6 +157,18 @@
   consumers should fall back to `perm-type-defaults`."
   nil)
 
+(def ^:dynamic *current-user-capabilities*
+  "The request's capabilities (strings/keywords as sent by the API). Bound in the request path
+  alongside `*current-user-scope*` so capability-gated checks (e.g. which skills are loadable)
+  match the manifest, which is built from the same capabilities. Defaults to `#{}`."
+  #{})
+
+(def ^:dynamic *current-loadable-skill-ids*
+  "Request-scoped atom containing the set of skill ids that appeared in the current
+  profile's skill manifest. When bound, `load_skill` rejects ids outside this set
+  even if the skill otherwise satisfies capability/scope gates."
+  nil)
+
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Permission → Scope mapping
 ;;; ──────────────────────────────────────────────────────────────────
@@ -155,7 +177,7 @@
   "Map from metabot permission type to the wildcard scope strings granted when
   that permission is `:yes`."
   {:permission/metabot-sql-generation #{"agent:sql:*" "agent:transforms:*" "agent:snippets:*"}
-   :permission/metabot-nlq            #{"agent:notebook:*" "agent:query:*" "agent:question:*"}
+   :permission/metabot-nlq            #{"agent:notebook:*" "agent:query:*" "agent:question:*" "agent:metric:*"}
    :permission/metabot-other-tools    #{"agent:viz:*" "agent:dashboard:*" "agent:document:*" "agent:alert:*"
                                         "agent:collection:*"}})
 

@@ -247,8 +247,7 @@
 (deftest ^:parallel remark-test
   (mt/test-driver :bigquery-cloud-sdk
     (is (= (with-test-db-name
-             (str "-- Metabase:: userID: 1000 queryType: MBQL queryHash: 01020304\n"
-                  "SELECT"
+             (str "SELECT"
                   " `v4_test_data.venues`.`id` AS `id`,"
                   " `v4_test_data.venues`.`name` AS `name`,"
                   " `v4_test_data.venues`.`category_id` AS `category_id`,"
@@ -256,7 +255,8 @@
                   " `v4_test_data.venues`.`longitude` AS `longitude`,"
                   " `v4_test_data.venues`.`price` AS `price` "
                   "FROM `v4_test_data.venues` "
-                  "LIMIT 1"))
+                  "LIMIT 1"
+                  "\n\n-- Metabase:: userID: 1000 queryType: MBQL queryHash: 01020304"))
            (query->native
             {:database (mt/id)
              :type     :query
@@ -1033,9 +1033,51 @@
     (testing "replace non-letter characters with underscores"
       (is (= "_"
              (driver/escape-alias :bigquery-cloud-sdk "😍"))))
+    (testing "preserve Unicode letters"
+      (is (= "通過後内定承諾応募数"
+             (driver/escape-alias :bigquery-cloud-sdk "通過後内定承諾応募数"))))
     (testing "trim long strings"
       (is (= "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_89971909"
              (driver/escape-alias :bigquery-cloud-sdk (str/join (repeat 300 "a"))))))))
+
+(deftest ^:parallel identifier-quoting-test
+  (letfn [(compile-identifier [& components]
+            (first (sql/format {:select [[(apply h2x/identifier :field components)]]}
+                               {:dialect (sql.qp/quote-style :bigquery-cloud-sdk), :quoted true})))]
+    (testing "ordinary identifiers are backtick-quoted"
+      (is (= "SELECT `my_dataset`.`my_table`.`my_field`"
+             (compile-identifier "my_dataset" "my_table" "my_field"))))
+    (testing "a backtick is escaped with a backslash, not doubled -- GoogleSQL has no doubling escape"
+      (is (= "SELECT `a\\`b`"
+             (compile-identifier "a`b"))))
+    (testing "a backslash is doubled, so it cannot escape the closing backtick"
+      (is (= "SELECT `a\\\\b`"
+             (compile-identifier "a\\b"))))
+    (testing "an identifier cannot break out into raw SQL"
+      (is (= (str "SELECT `__mb_source`.`a\\`\\\\\\`, (SELECT STRING_AGG(x) FROM other.secret) "
+                  "AS leak FROM ds.tbl -- `")
+             (compile-identifier "__mb_source" "a`\\`, (SELECT STRING_AGG(x) FROM other.secret) AS leak FROM ds.tbl -- ")))
+      (is (= "SELECT `x\\`\\\\\\`; DROP TABLE ds.tbl; -- `"
+             (compile-identifier "x`\\`; DROP TABLE ds.tbl; -- "))))))
+
+(deftest ^:parallel japanese-aggregation-aliases-test
+  (driver/with-driver :bigquery-cloud-sdk
+    (let [mp (mt/metadata-provider)
+          products (lib.metadata/table mp (mt/id :products))
+          price (lib.metadata/field mp (mt/id :products :price))
+          rating (lib.metadata/field mp (mt/id :products :rating))
+          category (lib.metadata/field mp (mt/id :products :category))
+          query (as-> (lib/query mp products) q
+                  (lib/aggregate q (lib/with-expression-name (lib/sum price) "通過後内定承諾応募数"))
+                  (lib/aggregate q (lib/with-expression-name (lib/sum rating) "通過後入社決定応募数"))
+                  (lib/breakout q category)
+                  (lib/order-by q (lib/aggregation-ref q 0))
+                  (lib/order-by q (lib/aggregation-ref q 1)))]
+      (is (= [["Doohickey" 2185 156]
+              ["Gizmo" 2834 185]
+              ["Gadget" 3019 181]
+              ["Widget" 3109 170]]
+             (mt/formatted-rows [str int int] (qp/process-query query)))))))
 
 (deftest ^:parallel remove-diacriticals-from-field-aliases-test
   (mt/test-driver :bigquery-cloud-sdk
@@ -1291,7 +1333,7 @@
              (-> (qp.compile/compile query)
                  :query
                  (->> (driver/prettify-native-form :bigquery-cloud-sdk))
-                 (str/replace #"sha_[a-z0-9]+_test_data" "test_data")
+                 (str/replace #"sha_[a-z0-9_]+_test_data" "test_data")
                  str/split-lines))))))
 
 (deftest ^:parallel case-expression-with-default-Date-case-DateTime-test
@@ -1368,3 +1410,14 @@
                              (mapv #(update % 0 inc)))]
               (is (= exp-rows
                      (mt/formatted-rows [int int int] (qp/process-query query)))))))))))
+
+(deftest ^:parallel interval-rejects-hostile-unit-test
+  (testing "the BigQuery INTERVAL sink refuses a unit outside its closed allow-list"
+    (let [hostile (keyword "day) FROM t2 UNION SELECT pw FROM secrets --")]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"Invalid temporal unit"
+           (#'bigquery.qp/interval 1 hostile))))
+    (testing "and still emits the expected INTERVAL token for a legitimate unit"
+      (is (= [:raw "INTERVAL 1 day"]
+             (#'bigquery.qp/interval 1 :day))))))

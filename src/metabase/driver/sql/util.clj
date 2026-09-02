@@ -78,7 +78,7 @@
 
       :else
       (do
-        (log/errorf "Don't know how to alias %s, expected an h2x/identifier" (pr-str col))
+        (log/errorf "Don't know how to alias %s, expected an h2x/identifier" (class col))
         [col col]))))
 
 (defn select-clause-deduplicate-aliases
@@ -162,7 +162,6 @@
    :n1ql        Dialect/N1ql
    :plsql       Dialect/PlSql
    :postgres    Dialect/PostgreSql
-   :postgres-mbql5 Dialect/PostgreSql
    :redshift    Dialect/Redshift
    :sparksql    Dialect/SparkSql
    :standardsql Dialect/StandardSql

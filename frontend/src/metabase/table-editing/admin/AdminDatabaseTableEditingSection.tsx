@@ -80,7 +80,7 @@ export function AdminDatabaseTableEditingSection({
 
   const { data: databaseMetadata, isLoading: isLoadingTables } =
     useGetDatabaseMetadataQuery(
-      { id: database.id },
+      { id: database.id, skip_fields: true },
       {
         skip: !ALLOWED_ENGINES_FOR_TABLE_EDITING.includes(
           database.engine ?? "",

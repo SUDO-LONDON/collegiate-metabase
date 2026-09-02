@@ -8,9 +8,10 @@ import { Link } from "metabase/common/components/Link";
 import { useValidatePassword } from "metabase/common/hooks";
 import { useToast } from "metabase/common/hooks/use-toast";
 import { useDispatch } from "metabase/redux";
+import { resetPassword } from "metabase/redux/auth";
 import { Button } from "metabase/ui";
+import * as Urls from "metabase/urls";
 
-import { resetPassword } from "../../actions";
 import type { ResetPasswordData } from "../../types";
 import { AuthLayout } from "../AuthLayout";
 import { ResetPasswordForm } from "../ResetPasswordForm";
@@ -42,8 +43,12 @@ export const ResetPassword = ({
 
   const handlePasswordSubmit = useCallback(
     async ({ password }: ResetPasswordData) => {
-      await dispatch(resetPassword({ token, password })).unwrap();
-      dispatch(replace(redirectUrl || "/"));
+      const { sessionCreated } = await dispatch(
+        resetPassword({ token, password }),
+      ).unwrap();
+      dispatch(
+        replace(sessionCreated ? redirectUrl || "/" : Urls.login(redirectUrl)),
+      );
       sendToast({ message: t`You've updated your password.` });
     },
     [token, dispatch, redirectUrl, sendToast],

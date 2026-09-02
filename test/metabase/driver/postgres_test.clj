@@ -32,12 +32,14 @@
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.sql.query-processor-test-util :as sql.qp-test-util]
    [metabase.driver.sql.util :as sql.u]
+   [metabase.lib-be.metadata.jvm :as lib.metadata.jvm]
    [metabase.lib.convert :as lib.convert]
    [metabase.lib.core :as lib]
    [metabase.lib.metadata :as lib.metadata]
    [metabase.lib.test-metadata :as meta]
    [metabase.lib.test-util :as lib.tu]
    [metabase.lib.test-util.metadata-providers.mock :as providers.mock]
+   [metabase.lib.test-util.notebook-helpers :as lib.tu.notebook]
    [metabase.notification.payload.temp-storage :as temp-storage]
    [metabase.query-processor.compile :as qp.compile]
    [metabase.query-processor.error-type :as qp.error-type]
@@ -52,8 +54,6 @@
    [metabase.sync.sync-metadata.tables :as sync-tables]
    [metabase.sync.util :as sync-util]
    [metabase.test :as mt]
-   [metabase.test.data.datasets :as mtd]
-   [metabase.test.data.env :as tx.env]
    [metabase.test.data.interface :as tx]
    [metabase.util :as u]
    [metabase.util.honey-sql-2 :as h2x]
@@ -69,18 +69,6 @@
 
 (set! *warn-on-reflection* true)
 
-;; TODO: once h2-mbql5 is on master, share code with that
-(defn- test-driver [driver thunk]
-  (when (contains? (tx.env/test-drivers) driver)
-    (testing (str "\n" driver "\n")
-      (driver/with-driver (tx/the-driver-with-test-extensions driver)
-        (thunk))
-      ;; the above is the original definition of test-driver, but we add in
-      ;; this clause to avoid having to rewrite all the tests below twice:
-      (when (= driver :postgres)
-        (driver/with-driver (tx/the-driver-with-test-extensions :postgres-mbql5)
-          (thunk))))))
-
 (use-fixtures :each (fn [thunk]
                       ;; 1. If sync fails when loading a test dataset, don't swallow the error; throw an Exception so we
                       ;;    can debug it. This is much less confusing when trying to fix broken tests.
@@ -88,25 +76,19 @@
                       ;; 2. Make sure we're in Honey SQL 2 mode for all the little SQL snippets we're compiling in these
                       ;;    tests.
                       (binding [sync-util/*log-exceptions-and-continue?* false]
-                        ;; NB: because of test parallelism, this *will* affect other non-pg
-                        ;; tests, but the check above in the test-driver function will
-                        ;; prevent it from actually doing anything different in those tests.
-                        ;;
-                        ;; The linter (`:metabase/validate-deftest`) flags `with-redefs` inside a
-                        ;; `use-fixtures` body because it isn't parallel-safe -- the root var is
-                        ;; mutated globally across threads. We accept the hazard here for the
-                        ;; duration of the `:postgres-mbql5` equivalence experiment: this fixture
-                        ;; reruns every `:postgres` test under the `:postgres-mbql5` dispatch so
-                        ;; we can confirm behavioral parity. Once the experiment concludes and
-                        ;; `:postgres-mbql5` becomes `:postgres`, this entire `with-redefs` goes
-                        ;; away (see Phil's note in #ee-querying-platform 2026-05-21).
-                        #_{:clj-kondo/ignore [:metabase/validate-deftest]}
-                        (with-redefs [mtd/-test-driver test-driver]
-                          (mt/with-test-user :rasta (thunk))))))
+                        (mt/with-test-user :rasta (thunk)))))
 
 (deftest ^:parallel extract-test
   (is (= ["extract(month from NOW())"]
          (sql.qp/format-honeysql :postgres (#'postgres/extract :month :%now)))))
+
+(deftest ^:parallel hour-bucketing-time-without-database-type-test
+  (testing (str "Hour bucketing on a TIME-typed expression without `:database-type` (as happens for "
+                "fields referenced by name from a source query, #75193) should use the time-aware path "
+                "and not cast to `timestamp`")
+    (let [expr (h2x/with-type-info :test_col {:effective-type :type/Time})]
+      (is (= ["MAKE_TIME(extract(hour from \"test_col\")::integer, 0, 0.0)"]
+             (sql.qp/format-honeysql :postgres (sql.qp/date :postgres :hour expr)))))))
 
 (deftest ^:parallel datetime-diff-test
   (is (= [["CAST("
@@ -121,7 +103,7 @@
            ")"]
           "2021-10-03T09:00:00"
           "2021-10-03T09:00:00"]
-         (as-> [:datetime-diff "2021-10-03T09:00:00" "2021-10-03T09:00:00" :year] <>
+         (as-> [:datetime-diff {} "2021-10-03T09:00:00" "2021-10-03T09:00:00" :year] <>
            (sql.qp/->honeysql :postgres <>)
            (sql.qp/format-honeysql :postgres <>)
            (update (vec <>) 0 #(str/split-lines (driver/prettify-native-form :postgres %)))))))
@@ -290,6 +272,7 @@
   [& args]
   (->> (apply driver/describe-database args)
        :tables
+       (into [])
        (sort-by :name)))
 
 (deftest materialized-views-test
@@ -445,7 +428,11 @@
     (testing "Give us a bigint cast when the field is bigint (#22732)"
       (let [boolean-boop-field {:database-type "bigint" :nfc-path [:bleh "boop" :foobar 1234]}]
         (is (= ["(boop.bleh#>> (array[?, ?, 1234]::text[]))::bigint" "boop" "foobar"]
-               (sql/format-expr (#'sql.qp/json-query :postgres boop-identifier boolean-boop-field))))))))
+               (sql/format-expr (#'sql.qp/json-query :postgres boop-identifier boolean-boop-field))))))
+    (testing "a database-type that isn't a plain type name is quoted as an identifier instead of spliced raw"
+      (let [evil-field {:database-type "integer); select 1 --" :nfc-path [:bleh :meh]}]
+        (is (= ["(\"boop\".\"bleh\"#>> (array[?]::text[]))::\"integer); select 1 --\"" "meh"]
+               (sql.qp/format-honeysql :postgres (#'sql.qp/json-query :postgres boop-identifier evil-field))))))))
 
 (deftest ^:parallel json-query-survives-impersonation-validation-test
   (testing "JSON-extracted field SQL still extracts the same value after `validate-impersonated-query*` re-emits it (#73776)"
@@ -495,7 +482,7 @@
 
 (defn- ^:private maybe-convert-and-compile [driver query]
   (cond-> query
-    (= driver :postgres-mbql5) (lib.convert/->mbql5)
+    (= driver :postgres) (lib.convert/->mbql5)
     :always qp.compile/compile))
 
 (defn- ^:private json-alias-mock-metadata-provider [driver]
@@ -613,9 +600,7 @@
                   "      \"json_alias_test\""
                   "    ORDER BY"
                   "      \"json_alias_test\" ASC"
-                  "  ) AS \"__mb_source\""
-                  "LIMIT"
-                  "  1048575"]
+                  "  ) AS \"__mb_source\""]
                  (str/split-lines (driver/prettify-native-form :postgres (:query nested))))))))))
 
 ;;; Postgres `:contains`/`:starts-with`/`:ends-with` must produce SQL that the PostgreSQL JDBC
@@ -950,6 +935,77 @@
                                           "bird type")
              (sql.qp/->honeysql driver/*driver* (sql.qp/mbql-clause-with-opts driver/*driver* :value {:database_type "bird type", :base_type :type/PostgresEnum} "toucan")))))))
 
+(defn- enum-value-honeysql [database-type]
+  (sql.qp/->honeysql
+   driver/*driver*
+   (sql.qp/mbql-clause-with-opts
+    driver/*driver* :value
+    {:database_type database-type, :base_type :type/PostgresEnum}
+    "toucan")))
+
+(deftest ^:parallel enum-type-name-is-never-raw-sql-test
+  (mt/test-driver :postgres
+    (testing "a caller-supplied :database-type never reaches the SQL type-name position as raw SQL"
+      (doseq [database-type ["\"int\") UNION SELECT 1 --\""
+                             "int) UNION SELECT 1 --"]]
+        (testing (pr-str database-type)
+          (let [form (h2x/unwrap-typed-honeysql-form (enum-value-honeysql database-type))]
+            (testing "the type name is an identifier, which the dialect quotes, not a raw fragment"
+              (is (h2x/identifier? (last form))))
+            (is (not (some #(and (vector? %) (= :raw (first %)))
+                           (tree-seq coll? seq form))))))))))
+
+(deftest ^:parallel enum-type-name-compiles-as-an-identifier-test
+  (mt/test-driver :postgres
+    (testing "the enum type names sync records keep working"
+      (testing "a bare type name, spaces and all"
+        (is (= (h2x/with-database-type-info [:cast "toucan" (h2x/identifier :type-name "bird type")] "bird type")
+               (enum-value-honeysql "bird type"))))
+      (testing "a schema-qualified type name stays qualified, as two identifier components"
+        (is (= (h2x/with-database-type-info
+                [:cast "toucan" (h2x/identifier :type-name "bird_schema" "bird_status")]
+                "\"bird_schema\".\"bird_status\"")
+               (enum-value-honeysql "\"bird_schema\".\"bird_status\"")))))))
+
+(deftest ^:parallel enum-type-name-malformed-test
+  (mt/test-driver :postgres
+    (testing "a malformed :database-type compiles to an inert identifier rather than raw SQL or an exception"
+      (doseq [database-type ["\""                                  ; a lone quote: starts and ends with the same char
+                             "\"\""                                ; nothing between the quotes
+                             "\"unterminated"                      ; opening quote only
+                             "unopened\""                          ; closing quote only
+                             "no_dots_at_all"
+                             "public.bird_status"                 ; dot, but unquoted
+                             "\"a\".\"b\".\"c\""                     ; more parts than Postgres accepts
+                             "\"a\"\".\"b\""                          ; an embedded doubled quote
+                             "\"\".\"\""                              ; empty components
+                             "\"a\" . \"b\""                          ; spaces around the separator
+                             ".."
+                             "\"..\""]]
+        (testing (pr-str database-type)
+          (let [form (h2x/unwrap-typed-honeysql-form (enum-value-honeysql database-type))]
+            (testing "the type name is an identifier"
+              (is (h2x/identifier? (last form))))
+            (testing "every component is a string, so the dialect can quote it"
+              (is (every? string? (last (last form)))))
+            (testing "nothing is emitted raw"
+              (is (not (some #(and (vector? %) (= :raw (first %)))
+                             (tree-seq coll? seq form)))))))))))
+
+(deftest ^:parallel day-bucketing-type-name-is-never-raw-sql-test
+  (testing "a :database-type on :day bucketing is emitted as a quoted identifier"
+    (doseq [database-type ["timestamptz) UNION SELECT 1 --"
+                           "\"int\") UNION SELECT 1 --"]]
+      (testing (pr-str database-type)
+        (let [form (h2x/unwrap-typed-honeysql-form
+                    (sql.qp/date :postgres :day (h2x/with-database-type-info :some_col database-type)))]
+          (testing "the outer cast's type name is an identifier, which the dialect quotes"
+            (is (h2x/identifier? (last form))))))))
+  (testing "a known temporal type is emitted raw, since dialects that inherit this impl reject a quoted type name"
+    (is (= ["SELECT CAST(CAST(\"some_col\" AS date) AS timestamptz)"]
+           (sql/format {:select [[(sql.qp/date :postgres :day (h2x/with-database-type-info :some_col "timestamptz"))]]}
+                       {:dialect :ansi :quoted true})))))
+
 (deftest enums-test-2
   (mt/test-driver :postgres
     (do-with-enums-db!
@@ -1029,6 +1085,37 @@
                                    :limit        10}})
                       :data
                       (select-keys [:rows :native_form]))))))))))
+
+(deftest enum-field-filter-test
+  (mt/test-driver :postgres
+    (do-with-enums-db!
+     (fn [db]
+       (let [mp            (lib.metadata.jvm/application-database-metadata-provider (u/the-id db))
+             table-id      (t2/select-one-pk :model/Table :db_id (u/the-id db) :name "birds")
+             type-field-id (t2/select-one-pk :model/Field :table_id table-id :name "type")
+             type-field    (lib.metadata/field mp type-field-id)]
+         (testing "an MBQL string/= param on a postgres enum column filters correctly (#40396)"
+           (is (= [["Rasta" "good bird" "sad bird" "toucan"]]
+                  (mt/rows
+                   (qp/process-query
+                    (assoc (lib/query mp (lib.metadata/table mp table-id))
+                           :parameters [{:type   :string/=
+                                         :target [:dimension (lib.convert/->legacy-MBQL (lib/ref type-field))]
+                                         :value  ["toucan"]}]))))))
+         (testing "a native field filter over a postgres enum column filters correctly (#63537)"
+           (is (= [["Rasta" "good bird" "sad bird" "toucan"]]
+                  (mt/rows
+                   (qp/process-query
+                    (assoc (-> (lib/native-query mp "SELECT * FROM birds WHERE {{type}}")
+                               (lib/with-template-tags
+                                 {"type" {:name         "type"
+                                          :display-name "Type"
+                                          :type         :dimension
+                                          :dimension    (lib/ref type-field)
+                                          :widget-type  :string/=}}))
+                           :parameters [{:type   :string/=
+                                         :target [:dimension [:template-tag "type"]]
+                                         :value  ["toucan"]}])))))))))))
 
 (deftest enums-test-3
   (mt/test-driver :postgres
@@ -1629,6 +1716,88 @@
                  (-> (qp.compile/compile query)
                      (update :query #(str/split-lines (driver/prettify-native-form :postgres %)))))))))))
 
+(defn- ist-convert-timezone-expression
+  "Returns `[base ist-expr]` for a lib query on `attempts` with a `convert-timezone` expression `ist_dt`."
+  []
+  (let [mp       (mt/metadata-provider)
+        datetime (lib.metadata/field mp (mt/id :attempts :datetime))
+        base     (-> (lib/query mp (lib.metadata/table mp (mt/id :attempts)))
+                     (lib/expression "ist_dt" (lib/convert-timezone datetime "Asia/Kolkata" "UTC")))
+        ist-expr (lib.tu.notebook/find-col-with-spec base
+                                                     (lib/filterable-columns base)
+                                                     {}
+                                                     {:display-name "ist_dt"})]
+    [base ist-expr]))
+
+(defn- assert-now-wrapped-in-target-timezone
+  "Compile `query` and assert that every `NOW()` in the SQL is wrapped in `TIMEZONE(?, NOW())`."
+  [query]
+  (let [sql       (:query (qp.compile/compile query))
+        bare-nows (count (re-seq #"(?i)\bNOW\(\)" sql))
+        wrapped   (count (re-seq #"(?i)TIMEZONE\(\s*\?\s*,\s*NOW\(\)\s*\)" sql))]
+    (is (pos? bare-nows)
+        "sanity: the compiled SQL uses NOW() as a filter boundary")
+    (is (= bare-nows wrapped)
+        (str "Every NOW() must be wrapped in TIMEZONE(?, NOW()) so it lands in the"
+             " target timezone of the convertTimezone LHS.\nSQL:\n" sql))))
+
+(deftest ^:parallel convert-timezone-relative-datetime-filter-test
+  ;; Regression for #80155.
+  (testing "Relative-datetime filter on a convertTimezone expression compiles LHS and RHS in the same wall-clock frame"
+    (mt/test-driver :postgres
+      (mt/dataset attempted-murders
+        (let [[base ist-expr] (ist-convert-timezone-expression)]
+          (assert-now-wrapped-in-target-timezone
+           (lib/filter base (lib/time-interval ist-expr -3 :month))))))))
+
+(deftest ^:parallel convert-timezone-bucketed-lhs-filter-test
+  ;; Regression for #80155.
+  (testing "A bucketed convertTimezone LHS still compiles LHS and RHS in the same wall-clock frame"
+    (mt/test-driver :postgres
+      (mt/dataset attempted-murders
+        ;; Field bucket (week) and relative-datetime bucket (month) are incompatible, so
+        ;; `optimize-temporal-clauses` (an index-friendliness rewrite that otherwise unbuckets the LHS)
+        ;; leaves this alone.
+        (let [[base ist-expr] (ist-convert-timezone-expression)]
+          (assert-now-wrapped-in-target-timezone
+           (lib/filter base (lib/>= (lib/with-temporal-bucket ist-expr :week)
+                                    (lib/relative-datetime -2 :month)))))))))
+
+(deftest ^:parallel convert-timezone-now-filter-test
+  ;; Regression for #80155.
+  (testing "A :now filter RHS on a convertTimezone LHS compiles both sides in the same wall-clock frame"
+    (mt/test-driver :postgres
+      (mt/dataset attempted-murders
+        (let [[base ist-expr] (ist-convert-timezone-expression)]
+          (assert-now-wrapped-in-target-timezone
+           (lib/filter base (lib/< ist-expr (lib/now)))))))))
+
+(deftest ^:parallel convert-timezone-today-filter-test
+  ;; Regression for #80155.
+  (testing "A :today filter RHS on a convertTimezone LHS compiles both sides in the same wall-clock frame"
+    (mt/test-driver :postgres
+      (mt/dataset attempted-murders
+        (let [[base ist-expr] (ist-convert-timezone-expression)]
+          (assert-now-wrapped-in-target-timezone
+           (lib/filter base (lib/< ist-expr (lib/today)))))))))
+
+(deftest ^:parallel convert-timezone-wrapped-in-datetime-add-filter-test
+  ;; Regression for #80155.
+  (testing "A convertTimezone nested inside datetime-add still compiles LHS and RHS in the same wall-clock frame"
+    (mt/test-driver :postgres
+      (mt/dataset attempted-murders
+        (let [mp       (mt/metadata-provider)
+              datetime (lib.metadata/field mp (mt/id :attempts :datetime))
+              base     (-> (lib/query mp (lib.metadata/table mp (mt/id :attempts)))
+                           (lib/expression "shifted"
+                                           (lib/datetime-add
+                                            (lib/convert-timezone datetime "Asia/Kolkata" "UTC")
+                                            1 :hour)))
+              shifted  (lib.tu.notebook/find-col-with-spec base (lib/filterable-columns base)
+                                                           {} {:display-name "shifted"})]
+          (assert-now-wrapped-in-target-timezone
+           (lib/filter base (lib/time-interval shifted -3 :month))))))))
+
 (deftest postgres-ssl-connectivity-test
   (mt/test-driver :postgres
     (if (config/config-bool :mb-postgres-ssl-test-ssl)
@@ -2117,7 +2286,9 @@
                FROM generate_series(1, 5000) AS i;"
             results (qp/process-query (mt/native-query {:query sql})
                                       (temp-storage/notification-rff
-                                       5000 {:context 'complex-types-in-notification-payload}))]
+                                       {:budget (temp-storage/make-resident-budget
+                                                 {:per-card 5000 :resident-cap Long/MAX_VALUE :floor Long/MAX_VALUE})}
+                                       {:context 'complex-types-in-notification-payload}))]
         (is (integer? (:data.rows-file-size results)))
         (is (temp-storage/streaming-temp-file? (-> results :data :rows)))
         (is (=? [1
@@ -2186,7 +2357,7 @@
   (mt/test-driver :postgres
     (letfn [(catch-exceptions [run]
               (let [query    (cond-> {:type :query, :database 1}
-                               (= driver/*driver* :postgres-mbql5) (lib.convert/->mbql5))
+                               (= driver/*driver* :postgres) (lib.convert/->mbql5))
                     metadata {}
                     rows     []
                     qp       (fn [query rff]
@@ -2307,32 +2478,28 @@
 
 (deftest set-network-timeout-test
   (mt/test-driver :postgres
-    (let [db-name (u/lower-case-en (format "network-timeout-%s-%s" (name driver/*driver*) (mt/random-name)))
-          spec    (sql-jdbc.conn/connection-details->spec
-                   driver/*driver*
-                   (mt/dbdef->connection-details driver/*driver* :db {:database-name db-name}))]
-      (tx/with-temp-database! driver/*driver* db-name
-        ;; Use a raw spec against a unique DB; the shared test-data DB can be created/dropped by concurrent
-        ;; :postgres and :postgres-mbql5 test setup.
-        (letfn [(run-pg-sleep []
-                  (sql-jdbc.execute/do-with-connection-with-options
-                   driver/*driver* spec nil
-                   (fn [^Connection conn]
-                     (with-open [stmt (.createStatement conn)]
-                       (.execute stmt "SELECT pg_sleep(6)")))))]
-          (testing "network hangs are interrupted after *network-timeout-ms*"
-            (binding [driver.settings/*network-timeout-ms* 3000]
-              (is (thrown-with-msg?
-                   org.postgresql.util.PSQLException
-                   #"An I/O error occurred while sending to the backend"
-                   (try
-                     (run-pg-sleep)
-                     (catch Exception e
-                       (is (true? (some #(instance? java.net.SocketTimeoutException %)
-                                        (u/full-exception-chain e))))
-                       (throw e)))))))
-          (testing "network hangs are not interrupted before *network-timeout-ms*"
-            (is (true? (run-pg-sleep)))))))))
+    (testing "network hangs are interrupted after *network-timeout-ms*"
+      (binding [driver.settings/*network-timeout-ms* 3000]
+        (is (thrown-with-msg?
+             org.postgresql.util.PSQLException
+             #"An I/O error occurred while sending to the backend"
+             (try
+               (sql-jdbc.execute/do-with-connection-with-options
+                driver/*driver* (mt/id) nil
+                (fn [^Connection conn]
+                  (with-open [stmt (.createStatement conn)]
+                    (.execute stmt "SELECT pg_sleep(6)"))))
+               (catch Exception e
+                 (is (true? (some #(instance? java.net.SocketTimeoutException %)
+                                  (u/full-exception-chain e))))
+                 (throw e)))))))
+    (testing "network hangs are not interrupted before *network-timeout-ms*"
+      (is (true?
+           (sql-jdbc.execute/do-with-connection-with-options
+            driver/*driver* (mt/id) nil
+            (fn [^Connection conn]
+              (with-open [stmt (.createStatement conn)]
+                (.execute stmt "SELECT pg_sleep(6)")))))))))
 
 (deftest ^:parallel parse-final-identifier-test
   (mt/test-driver :postgres
@@ -2485,3 +2652,109 @@
                       (jdbc/execute! admin-spec
                                      [(format "GRANT %s TO %s" qowner qrole)])
                       (is (nil? (postgres/assert-can-alter-default-privileges! user-spec schema))))))))))))))
+
+(deftest ^:synchronized workspace-destroy-survives-foreign-grantor-default-priv-test
+  ;; PostgreSQL counterpart to Redshift's GHY-3709 destroy fix. The Redshift
+  ;; driver had to grow explicit `pg_default_acl` discovery + per-grantor
+  ;; REVOKEs because Redshift's `DROP OWNED BY` semantics differ from PG. PG's
+  ;; destroy issues `DROP OWNED BY <iso-user>` which removes default-priv ACL
+  ;; entries where the iso-user appears as a grantee, regardless of who granted
+  ;; them. This test pins that contract: seed a foreign-grantor default-priv
+  ;; row targeting the iso-user and confirm `destroy-workspace-isolation!`
+  ;; still cleans up without raising "user cannot be dropped because some
+  ;; objects depend on it".
+  (mt/test-driver :postgres
+    (testing "destroy succeeds when a non-current_user grantor seeded a default-priv targeting the iso-user"
+      (mt/with-empty-db
+        (let [admin-spec (sql-jdbc.conn/db->pooled-connection-spec (mt/db))
+              grantor    "ws_destroy_foreign_grantor"
+              schema     "ws_destroy_foreign_schema"
+              qgrantor   (sql.u/quote-name :postgres :field grantor)
+              qschema    (sql.u/quote-name :postgres :schema schema)
+              workspace  {:id   (rand-int Integer/MAX_VALUE)
+                          :name "wsd-foreign-destroy"}]
+          (with-drop-role! admin-spec grantor
+            (with-drop-schema! admin-spec schema
+              (jdbc/execute! admin-spec
+                             [(format (str "CREATE ROLE %s WITH LOGIN PASSWORD 'pwd'; "
+                                           "GRANT %s TO CURRENT_USER; "
+                                           "CREATE SCHEMA %s AUTHORIZATION %s;")
+                                      qgrantor qgrantor qschema qgrantor)])
+              (let [init-result   (driver/init-workspace-isolation! :postgres (mt/db) workspace)
+                    iso-user      (-> init-result :database_details :user)
+                    qiso          (sql.u/quote-name :postgres :field iso-user)
+                    workspace+det (merge workspace init-result)]
+                (try
+                  ;; Seed the foreign-grantor default-priv: set the grantor role and
+                  ;; issue ALTER DEFAULT PRIVILEGES so the resulting pg_default_acl
+                  ;; row is owned by the grantor, not by current_user.
+                  (jdbc/execute! admin-spec
+                                 [(format (str "SET ROLE %s; "
+                                               "ALTER DEFAULT PRIVILEGES IN SCHEMA %s "
+                                               "GRANT SELECT ON TABLES TO %s; "
+                                               "RESET ROLE;")
+                                          qgrantor qschema qiso)])
+                  (testing "destroy completes without error"
+                    (is (some? (driver/destroy-workspace-isolation! :postgres (mt/db) workspace+det))))
+                  (testing "the iso-user has been dropped"
+                    (is (empty? (jdbc/query admin-spec
+                                            ["SELECT 1 FROM pg_roles WHERE rolname = ?" iso-user]))))
+                  (finally
+                    ;; If destroy raised, the iso-user may still exist -- clean up so the
+                    ;; with-drop-role!/with-drop-schema! frames don't fail on the schema.
+                    ;; Log instead of swallowing so CI surfaces orphan-role accumulation
+                    ;; rather than masking it behind a failed schema drop downstream.
+                    (try (jdbc/execute! admin-spec
+                                        [(format "DROP OWNED BY %s CASCADE" qiso)])
+                         (catch Throwable t
+                           (log/warnf t "Test cleanup: DROP OWNED BY %s failed" qiso)))
+                    (try (jdbc/execute! admin-spec
+                                        [(format "DROP USER IF EXISTS %s" qiso)])
+                         (catch Throwable t
+                           (log/warnf t "Test cleanup: DROP USER %s failed" qiso)))))))))))))
+
+(deftest ^:synchronized reducible-query-streams-large-result-set-test
+  (testing "reducible-query streams large result sets via a server-side cursor (autoCommit=false)"
+    (mt/test-driver :postgres
+      ;; A 2.1-billion-row generate_series in the SELECT list streams row-by-row (no server-side materialization).
+      ;; Pulling just the first few is fast ONLY if reducible-query streams (a cursor) and stops early; without
+      ;; streaming the JDBC driver buffers the whole ResultSet (~2.1B rows) and OOMs at any heap size.
+      (let [n      Integer/MAX_VALUE
+            result (sql-jdbc.execute/reducible-query
+                    (mt/db) [(format "SELECT generate_series(1, %d) AS i" n)])]
+        (testing "only the first rows are pulled, not all ~2 billion"
+          (is (= [1 2 3] (into [] (comp (take 3) (map :i)) result))))))))
+
+(deftest ^:parallel value-clause-collection-guard-test
+  (testing "the :postgres [driver :value] override must not compile a collection into SQL"
+    ;; these base types build a CAST from the value itself instead of recursing through ->honeysql, so they never hit
+    ;; the guard on the base [:sql :value] method. The value slot is schema-typed `any?`, so a hand-written clause
+    ;; carries a Honey SQL form like `[{:raw "..."}]` past query validation. :redshift inherits this method.
+    (doseq [base-type     [:type/PostgresBitString :type/IPAddress :type/PostgresEnum]
+            [label value] {"map inside a vector"   [{:raw "1) UNION SELECT 1 -- "}]
+                           "sub-select in vector"  [{:select [:password] :from [:core_user]}]
+                           "honeysql op in vector" [[:raw "1) UNION SELECT 1 -- "]]
+                           "bare map"              {:raw "1) UNION SELECT 1 -- "}
+                           "a set"                 #{"a" "b"}}]
+      (testing (str base-type " -- " label)
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"\QUnexpected collection in a :value clause\E"
+             (sql.qp/->honeysql :postgres [:value {:base-type base-type, :database-type "my_enum"} value]))))))
+  (testing "ordinary literals still compile"
+    (is (= (h2x/cast :inet "1.2.3.4")
+           (sql.qp/->honeysql :postgres [:value {:base-type :type/IPAddress} "1.2.3.4"])))))
+
+(deftest ^:parallel regex-match-first-pattern-raw-guard-test
+  (testing "the :postgres [:regex-match-first] pattern must be compiled through ->honeysql, not spliced raw"
+    ;; a stored source card can carry a Honey SQL [:raw ...] form in the pattern slot past whole-query validation;
+    ;; routing it through ->honeysql makes multimethod dispatch reject it before any SQL text is produced.
+    (doseq [pattern [[:raw "'x') AS x, (SELECT string_agg(email, ',') FROM public.users"]
+                     [:raw "anything"]]]
+      (testing (pr-str pattern)
+        (is (thrown?
+             clojure.lang.ExceptionInfo
+             (sql.qp/->honeysql :postgres [:regex-match-first {} 1 pattern]))))))
+  (testing "ordinary string patterns still compile"
+    (is (= [::postgres/regex-match-first [:inline 1] "^Taylor's"]
+           (sql.qp/->honeysql :postgres [:regex-match-first {} 1 "^Taylor's"])))))

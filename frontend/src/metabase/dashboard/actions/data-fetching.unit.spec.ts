@@ -22,6 +22,8 @@ import {
   createMockDashboardCard,
   createMockDashboardQueryMetadata,
   createMockDashboardTab,
+  createMockVirtualCard,
+  createMockVirtualDashCard,
 } from "metabase-types/api/mocks";
 import { createSampleDatabase } from "metabase-types/api/mocks/presets";
 
@@ -269,6 +271,64 @@ describe("fetchDashboard", () => {
     expect(firstResult.payload).toMatchObject({ result: null });
     // Second fetch completes with the API response
     expect(secondResult.payload).toMatchObject({ result: { foo: true } });
+  });
+
+  it("loads an embedded dashboard with virtual cards without mutating the frozen RTK response", async () => {
+    // RTK Query freezes its cached responses, so the virtual-card merge must
+    // not mutate the returned dashcards in place (metabase public/embed/x-ray
+    // dashboards otherwise fail to load).
+    const token = "header.payload.signature";
+    const dashboard = createMockDashboard({
+      id: token as unknown as number,
+      dashcards: [
+        createMockVirtualDashCard({
+          id: 1,
+          visualization_settings: {
+            virtual_card: createMockVirtualCard({ display: "heading" }),
+            text: "A heading",
+          },
+        }),
+      ],
+    });
+
+    fetchMock.get(`path:/api/embed/dashboard/${token}`, dashboard);
+
+    const store = setup();
+
+    const result = await store.dispatch(
+      fetchDashboard({
+        dashId: token,
+        queryParams: {},
+        options: {},
+      }),
+    );
+
+    expect(result.type).toBe("metabase/dashboard/FETCH_DASHBOARD/fulfilled");
+  });
+
+  it("uses a prefetched dashboard instead of re-fetching it", async () => {
+    const dashboard = createMockDashboard({ id: 1, name: "Prefetched" });
+
+    // setup() mocks GET /api/dashboard/1, so reaching it here would succeed —
+    // the assertion below proves the prefetched path skips it entirely.
+    const store = setup({ dashboards: [dashboard] });
+
+    const result = await store.dispatch(
+      fetchDashboard({
+        dashId: 1,
+        queryParams: {},
+        options: { prefetchedDashboard: dashboard },
+      }),
+    );
+
+    expect(result.type).toBe("metabase/dashboard/FETCH_DASHBOARD/fulfilled");
+    expect(result.payload).toMatchObject({
+      dashboardId: 1,
+      dashboard: { id: 1, name: "Prefetched" },
+    });
+    expect(
+      fetchMock.callHistory.called("path:/api/dashboard/1", { method: "GET" }),
+    ).toBe(false);
   });
 });
 

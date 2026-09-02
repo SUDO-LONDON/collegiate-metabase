@@ -109,6 +109,12 @@
              (:id field) constraints {}))
           ;; No constraints: pull the raw distinct values. `distinct-values` row-caps at
           ;; `*distinct-limit*`; we treat hitting that as `has_more_values`.
+          ;; A nil back from it means either the warehouse query failed or the field genuinely has no
+          ;; values, and sandboxing depends on the second reading: see
+          ;; `metabase-enterprise.sandbox.api.field-test/field-values-test`, which expects a 200 and no
+          ;; values when a sandbox matches no rows. Telling the two apart would need a change in
+          ;; `distinct-values` itself; until then a failed fetch is stored as empty and reused until the
+          ;; advanced FieldValues expire.
           (let [rows (-> (field-values/distinct-values field) :values)]
             {:values          rows
              :has_more_values (= (count rows) field-values/*distinct-limit*)}))
@@ -123,19 +129,19 @@
    The human_readable_values of Advanced FieldValues will be automatically fixed up based on the
    list of values and human_readable_values of the full FieldValues of the same field."
   [field hash-key constraints]
-  (when-let [{wrapped-values :values :keys [has_more_values]}
-             (fetch-advanced-field-values field constraints)]
-    (let [;; each value in `wrapped-values` is a 1-tuple, so unwrap the raw values for storage
-          values                (map first wrapped-values)
-          ;; If the full FieldValues of this field have human-readable-values, ensure that we reuse them
-          full-field-values     (field-values/get-latest-full-field-values (:id field))
-          human-readable-values (field-values/fixup-human-readable-values full-field-values values)]
-      {:field_id              (:id field)
-       :type                  :advanced
-       :hash_key              hash-key
-       :has_more_values       has_more_values
-       :human_readable_values human-readable-values
-       :values                values})))
+  (let [{wrapped-values :values :keys [has_more_values]}
+        (fetch-advanced-field-values field constraints)
+        ;; each value in `wrapped-values` is a 1-tuple, so unwrap the raw values for storage
+        values                (map first wrapped-values)
+        ;; If the full FieldValues of this field have human-readable-values, ensure that we reuse them
+        full-field-values     (field-values/get-latest-full-field-values (:id field))
+        human-readable-values (field-values/fixup-human-readable-values full-field-values values)]
+    {:field_id              (:id field)
+     :type                  :advanced
+     :hash_key              hash-key
+     :has_more_values       has_more_values
+     :human_readable_values human-readable-values
+     :values                values}))
 
 (defn get-or-create-field-values!
   "Gets or creates field values."

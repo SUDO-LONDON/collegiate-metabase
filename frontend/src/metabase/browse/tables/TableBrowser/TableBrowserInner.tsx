@@ -167,7 +167,7 @@ const TableBrowserItemButtons = ({
             to={`/auto/dashboard/table/${tableId}`}
             size="sm"
             tooltip={t`X-ray this table`}
-            color="warning"
+            color="feedback-warning"
             aria-label={t`X-ray this table`}
             onClick={trackBrowseXRayClicked}
           >

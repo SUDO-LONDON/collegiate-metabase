@@ -824,12 +824,11 @@
   (testing "Dashcard parameter mappings have valid targets when X-raying models (#58214)"
     (mt/dataset test-data
       (mt/with-temp
-        [:model/Card {model-id :id} {:table_id      (mt/id :orders)
-                                     :dataset_query (mt/mbql-query orders)
-                                     :type          :model}]
-        (is (vector? (-> (qp.card-test/run-query-for-card model-id) :data :results_metadata :columns)))
-        (let [model-card (t2/select-one :model/Card model-id)
-              dashboard (magic/automagic-analysis model-card nil)
+        [:model/Card model-card {:table_id      (mt/id :orders)
+                                 :dataset_query (mt/mbql-query orders)
+                                 :type          :model}]
+        (is (vector? (-> (qp.card-test/run-query-for-card model-card) :data :results_metadata :columns)))
+        (let [dashboard (magic/automagic-analysis model-card nil)
               parameter-mappings (eduction (comp (keep :parameter_mappings) cat) (:dashcards dashboard))
               dimension? (mr/validator ::mbql.s/dimension)]
           (is (every? (comp dimension? :target) parameter-mappings)))))))
@@ -1104,7 +1103,9 @@
         (let [database (t2/select-one :model/Database :id db-id)]
           (t2/with-call-count [call-count]
             (magic/candidate-tables database)
-            (is (= 2 (call-count)))))))))
+            ;; 1. load the tables, 2. their permissions in one primed load however many there are, 3. the databases'
+            ;; own grants, which `table-permission-for-user` coalesces in and which loads once per request.
+            (is (<= (call-count) 3))))))))
 
 (deftest ^:parallel empty-table-test
   (testing "candidate-tables should work with an empty Table (no Fields)"

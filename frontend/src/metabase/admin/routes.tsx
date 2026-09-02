@@ -35,21 +35,27 @@ import {
   EmbeddingSettings,
   GuestEmbedsSettings,
 } from "metabase/admin/settings/components/EmbeddingSettings";
-import { Help } from "metabase/admin/tools/components/Help";
-import { JobInfoApp } from "metabase/admin/tools/components/JobInfoApp";
-import { JobTriggersModal } from "metabase/admin/tools/components/JobTriggersModal";
-import { LogLevelsModal } from "metabase/admin/tools/components/LogLevelsModal";
-import { Logs } from "metabase/admin/tools/components/Logs";
-import {
-  ModelCachePage,
-  ModelCacheRefreshJobModal,
-} from "metabase/admin/tools/components/ModelCacheRefreshJobs";
 import {
   SetupPermissionsAndTenantsPage,
   SetupSsoPage,
 } from "metabase/embedding/embedding-hub";
 import { ModalRoute } from "metabase/hoc/ModalRoute";
 import { DataModelV1 } from "metabase/metadata/pages/DataModelV1";
+import { Help } from "metabase/monitor/tools/components/Help";
+import { JobInfoApp } from "metabase/monitor/tools/components/JobInfoApp";
+import { JobTriggersModal } from "metabase/monitor/tools/components/JobTriggersModal";
+import { LogLevelsModal } from "metabase/monitor/tools/components/LogLevelsModal";
+import { Logs } from "metabase/monitor/tools/components/Logs";
+import {
+  ModelCachePage,
+  ModelCacheRefreshJobModal,
+} from "metabase/monitor/tools/components/ModelCacheRefreshJobs";
+import { ToolsApp } from "metabase/monitor/tools/components/ToolsApp";
+import { ToolsUpsell } from "metabase/monitor/tools/components/ToolsUpsell";
+import {
+  getNotificationsRoutes,
+  getTasksRoutes,
+} from "metabase/monitor/tools/routes";
 import {
   PLUGIN_ADMIN_TOOLS,
   PLUGIN_ADMIN_USER_MENU_ROUTES,
@@ -63,19 +69,17 @@ import {
   PLUGIN_TENANTS,
   PLUGIN_WORKSPACES,
   PLUGIN_WRITABLE_CONNECTION,
+  PerformanceTabId,
 } from "metabase/plugins";
 import type { State } from "metabase/redux/store";
-import { getTokenFeature } from "metabase/setup";
+import { getTokenFeature } from "metabase/selectors/settings";
 
 import { AISettingsPage, McpSettingsPage } from "./ai/AISettingsPage";
 import { MetabotAdminLayout } from "./ai/MetabotAdminLayout";
+import { OAuthAuthorizationsPage } from "./ai/OAuthAuthorizationsPage";
 import { ModelPersistenceConfiguration } from "./performance/components/ModelPersistenceConfiguration";
 import { StrategyEditorForDatabases } from "./performance/components/StrategyEditorForDatabases";
-import { PerformanceTabId } from "./performance/types";
 import { getSettingsRoutes } from "./settingsRoutes";
-import { ToolsApp } from "./tools/components/ToolsApp";
-import { ToolsUpsell } from "./tools/components/ToolsUpsell";
-import { getNotificationsRoutes, getTasksRoutes } from "./tools/routes";
 import { UpsellTenants } from "./upsells/UpsellTenants";
 import {
   RedirectToAllowedSettings,
@@ -90,7 +94,6 @@ export const getRoutes = (
 ) => {
   const state = store.getState();
   const hasSimpleEmbedding = getTokenFeature(state, "embedding_simple");
-  const hasAuditApp = getTokenFeature(state, "audit_app");
 
   return (
     <Route path="/admin" component={CanAccessSettings}>
@@ -103,7 +106,7 @@ export const getRoutes = (
           </Route>
           <Route path=":databaseId/edit" component={DatabasePage} />
           {PLUGIN_WRITABLE_CONNECTION.getWritableConnectionInfoRoutes(IsAdmin)}
-          {PLUGIN_WORKSPACES.getAdminConnectionInfoRoutes(IsAdmin)}
+          {PLUGIN_WORKSPACES.getWorkspaceDatabaseRoutes(IsAdmin)}
           <Route path=":databaseId" component={DatabaseEditApp}>
             {PLUGIN_DB_ROUTING.getDestinationDatabaseRoutes(IsAdmin)}
           </Route>
@@ -282,6 +285,21 @@ export const getRoutes = (
             <Route key="mcp" path="mcp" component={McpSettingsPage} />
           </Route>
           <Route
+            key="mcp-authorizations-layout"
+            component={(props) => (
+              <MetabotAdminLayout
+                {...props}
+                fullWidth
+                innerContentProps={{ fullWidth: true, fullHeight: true }}
+              />
+            )}
+          >
+            <Route
+              path="mcp/authorizations"
+              component={OAuthAuthorizationsPage}
+            />
+          </Route>
+          <Route
             key="layout"
             component={(props) => (
               <MetabotAdminLayout
@@ -327,25 +345,16 @@ export const getRoutes = (
               )}
             </Route>
             <Route path="tasks">{getTasksRoutes()}</Route>
-            {hasAuditApp && (
-              <Route path="notifications">{getNotificationsRoutes()}</Route>
-            )}
+            <Route path="notifications">{getNotificationsRoutes()}</Route>
             <Route path="jobs" component={JobInfoApp}>
               <ModalRoute
                 path=":jobKey"
                 modal={JobTriggersModal}
-                modalProps={{ wide: true }}
+                modalProps={{ size: "85%" }}
               />
             </Route>
             <Route path="logs" component={Logs}>
-              <ModalRoute
-                path="levels"
-                modal={LogLevelsModal}
-                modalProps={{
-                  // EventSandbox interferes with mouse text selection in CodeMirror editor
-                  disableEventSandbox: true,
-                }}
-              />
+              <ModalRoute path="levels" modal={LogLevelsModal} />
             </Route>
             {PLUGIN_DEPENDENCIES.isEnabled && (
               <Route

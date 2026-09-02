@@ -14,7 +14,7 @@
   in [[metabase.premium-features.core/fetch-token-status]]. (`site-uuid` is used for anonymous
   analytics aka stats and if we sent it along with the premium features token check API request it would no longer be
   anonymous.)"
-  :encryption :when-encryption-key-set
+  :encryption :no
   :visibility :internal
   :base       setting/uuid-nonce-base
   :doc        false)
@@ -32,6 +32,7 @@
 
 (defsetting token-status
   (deferred-tru "Cached token status for premium features. This is to avoid an API request on the the first page load.")
+  :encryption :no
   :visibility :admin
   :type       :json
   :audit      :never
@@ -174,6 +175,10 @@
   "Should we enable user/group provisioning via SCIM?"
   :scim)
 
+(define-premium-feature enable-multi-factor-auth?
+  "Should we enable native multi-factor authentication for interactive logins?"
+  :multi-factor-auth)
+
 (defn enable-any-sso?
   "Should we enable any SSO-based authentication?"
   []
@@ -275,6 +280,11 @@
 (define-premium-feature ^{:added "0.56.0"} enable-semantic-search?
   "Should we enable the semantic search backend?"
   :semantic-search)
+
+(define-premium-feature ^{:added "0.63.0"} enable-library-retrieval?
+  "Should we enable the Metabot library entity-retrieval tool (retrieve_library_entities)?
+  Independent of `:semantic-search`: this gates only that tool, not the general semantic search engine."
+  :library-retrieval)
 
 (define-premium-feature ^{:added "0.57.0"} table-data-editing?
   "Should we allow users to edit the data within tables?"
@@ -390,6 +400,7 @@
    :database_auth_providers        (enable-database-auth-providers?)
    :database_routing               (enable-database-routing?)
    :library                        (enable-library?)
+   :library_retrieval              (enable-library-retrieval?)
    :dependencies                   (enable-dependencies?)
    :schema-viewer                  (enable-schema-viewer?)
    :development_mode               (development-mode?)
@@ -404,6 +415,7 @@
    :hosting                        (is-hosted?)
    :metabot-v3                     (enable-metabot-v3?)
    :metabase-ai-managed            (enable-metabase-ai-managed?)
+   :multi-factor-auth              (enable-multi-factor-auth?)
    :offer-metabase-ai-managed      (enable-offer-metabase-ai-managed?)
    :official_collections           (enable-official-collections?)
    :query_reference_validation     (enable-query-reference-validation?)
@@ -432,6 +444,7 @@
 
 (defsetting token-features
   "Features registered for this instance's token"
+  :encryption :no
   :visibility :public
   :setter     :none
   :getter     -token-features

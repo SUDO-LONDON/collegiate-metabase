@@ -25,6 +25,7 @@ import type {
   SdkIframeEmbedSettings,
   SdkIframeEmbedTagMessage,
 } from "./types/embed";
+import { listenForEajsMessages } from "./utils/post-message";
 import { attributeToSettingKey, parseAttributeValue } from "./webcomponents";
 
 // Import EE Iframe Embedding script plugins
@@ -161,6 +162,7 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
     Set<SdkIframeEmbedEventHandler>
   > = new Map();
   private _authManager: EmbedAuthManager | null = null;
+  private _removeMessageListener: (() => void) | null = null;
 
   ["custom-context"]: unknown;
 
@@ -177,9 +179,9 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
   get properties(): SdkIframeEmbedElementSettings {
     const attributesConverted = this._attributeNames.reduce(
       (acc, attr) => {
-        const attrValue = this.getAttribute(attr as string);
+        const attrValue = this.getAttribute(attr);
         if (attrValue !== null) {
-          const key = attributeToSettingKey(attr as string);
+          const key = attributeToSettingKey(attr);
           acc[key] = parseAttributeValue(attrValue);
         }
         return acc;
@@ -202,7 +204,7 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
     options?: boolean | AddEventListenerOptions,
   ): void {
     if (type === "ready") {
-      const eventType = type as SdkIframeEmbedEvent["type"];
+      const eventType = type;
       const handler = listener as SdkIframeEmbedEventHandler;
       if (!this._eventHandlers.has(eventType)) {
         this._eventHandlers.set(eventType, new Set());
@@ -219,11 +221,7 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
     }
 
     // Fall back to the native HTMLElement event mechanism for all other events.
-    super.addEventListener(
-      type,
-      listener as EventListenerOrEventListenerObject,
-      options,
-    );
+    super.addEventListener(type, listener, options);
   }
 
   removeEventListener(
@@ -232,7 +230,7 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
     options?: boolean | EventListenerOptions,
   ): void {
     if (type === "ready") {
-      const eventType = type as SdkIframeEmbedEvent["type"];
+      const eventType = type;
       const handler = listener as SdkIframeEmbedEventHandler;
       const handlers = this._eventHandlers.get(eventType);
 
@@ -246,11 +244,7 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
       return;
     }
 
-    super.removeEventListener(
-      type,
-      listener as EventListenerOrEventListenerObject,
-      options,
-    );
+    super.removeEventListener(type, listener, options);
   }
 
   /**
@@ -278,7 +272,8 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
   }
 
   destroy() {
-    window.removeEventListener("message", this._handleMessage);
+    this._removeMessageListener?.();
+    this._removeMessageListener = null;
     this._isEmbedReady = false;
     this._eventHandlers.clear();
     this._authManager = null;
@@ -327,16 +322,14 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
     const key = attributeToSettingKey(
       attrName,
     ) as keyof SdkIframeEmbedElementSettings;
-    if (
-      (DISABLE_UPDATE_FOR_KEYS as readonly string[]).includes(key as string)
-    ) {
+    if ((DISABLE_UPDATE_FOR_KEYS as readonly string[]).includes(key)) {
       console.error(`${key} cannot be updated after the embed is created`);
       return;
     }
 
     this._updateSettings({
       [key]: parseAttributeValue(newVal),
-    } as Partial<SdkIframeEmbedElementSettings>);
+    });
   }
 
   private _emitEvent(event: SdkIframeEmbedEvent) {
@@ -367,7 +360,15 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
 
     this._iframe.setAttribute("data-metabase-embed", "true");
 
-    window.addEventListener("message", this._handleMessage);
+    // Chrome blocks the Clipboard API in cross-origin iframes unless the host
+    // explicitly delegates the permission (e.g. copying a Metabot answer).
+    this._iframe.setAttribute("allow", "clipboard-write");
+
+    this._removeMessageListener = listenForEajsMessages({
+      messageSource: "iframe-content",
+      iframe: this._iframe,
+      handler: this._handleMessage,
+    });
 
     this.appendChild(this._iframe);
   }
@@ -418,19 +419,8 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
     }
   }
 
-  private _handleMessage = async (
-    event: MessageEvent<SdkIframeEmbedTagMessage>,
-  ) => {
-    if (event.source !== this._iframe?.contentWindow) {
-      // ignore messages from other iframes
-      return;
-    }
-
-    if (!event.data) {
-      return;
-    }
-
-    if (event.data.type === "metabase.embed.iframeReady") {
+  private _handleMessage = async (message: SdkIframeEmbedTagMessage) => {
+    if (message.type === "metabase.embed.iframeReady") {
       if (this._isEmbedReady) {
         return;
       }
@@ -453,17 +443,16 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
       this._emitEvent({ type: "ready" });
     }
 
-    if (event.data.type === "metabase.embed.requestSessionToken") {
+    if (message.type === "metabase.embed.requestSessionToken") {
       await this._authenticate();
     }
 
-    if (event.data.type === "metabase.embed.requestGuestTokenRefresh") {
-      await this._refreshGuestToken(event.data.data.expiredToken);
+    if (message.type === "metabase.embed.requestGuestTokenRefresh") {
+      await this._refreshGuestToken(message.data.expiredToken);
     }
 
-    // Note: if we wrap other functions like this, let's come up with a generic utility function
-    if (event.data.type === "metabase.embed.handleLink") {
-      const { url, requestId } = event.data.data;
+    if (message.type === "metabase.embed.handleLink") {
+      const { url, requestId } = message.data;
       const handleLink = this.globalSettings.pluginsConfig?.handleLink;
 
       let handled = false;
@@ -485,15 +474,15 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
       );
     }
 
-    if (event.data.type === "metabase.embed.parametersChange") {
+    if (message.type === "metabase.embed.parametersChange") {
       this.dispatchEvent(
-        new CustomEvent("parameters-change", { detail: event.data.data }),
+        new CustomEvent("parameters-change", { detail: message.data }),
       );
     }
 
-    if (event.data.type === "metabase.embed.sqlParametersChange") {
+    if (message.type === "metabase.embed.sqlParametersChange") {
       this.dispatchEvent(
-        new CustomEvent("sql-parameters-change", { detail: event.data.data }),
+        new CustomEvent("sql-parameters-change", { detail: message.data }),
       );
     }
   };
@@ -728,7 +717,7 @@ export abstract class MetabaseEmbedElement<T extends string[] = string[]>
       // synced with the caller's intent.
       this._updateSettings({
         [settingKey]: value,
-      } as Partial<SdkIframeEmbedElementSettings>);
+      });
 
       return;
     }

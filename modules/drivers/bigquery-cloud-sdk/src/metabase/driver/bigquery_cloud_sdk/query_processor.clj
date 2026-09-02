@@ -166,7 +166,7 @@
 
 (defn- parse-timestamp-str [timezone-id s]
   ;; Timestamp strings either come back as ISO-8601 strings or Unix timestamps in seconds, e.g. "1.3963104E9"
-  (log/tracef "Parse timestamp string '%s' (default timezone ID = %s)" s timezone-id)
+  (log/tracef "Parsing timestamp string (default timezone ID = %s)" timezone-id)
   (if-let [seconds (u/ignore-exceptions (Double/parseDouble s))]
     (let [full-seconds (long seconds)
           ;; BigQuery timestamps have microsecond precision
@@ -381,8 +381,7 @@
 
         (contains? #{:date :time :datetime :timestamp} target-type)
         (do
-          (log/tracef "Coercing %s (temporal type = %s) to %s"
-                      (binding [*print-meta* true] (pr-str x))
+          (log/tracef "Coercing expression (temporal type = %s) to %s"
                       (pr-str (temporal-type x))
                       target-type)
           (let [expr (if-let [report-zone (when (or (= current-type :timestamp)
@@ -572,8 +571,8 @@
     (sql.u/validate-convert-timezone-args timestamptz? target-timezone source-timezone)
     (-> (if timestamptz?
           hsql-form
-          [:timestamp hsql-form (or source-timezone (driver-api/results-timezone-id))])
-        (datetime target-timezone)
+          [:timestamp hsql-form (sql.qp/->honeysql driver (or source-timezone (driver-api/results-timezone-id)))])
+        (datetime (sql.qp/->honeysql driver target-timezone))
         (with-temporal-type :datetime))))
 
 (defmethod sql.qp/float-dbtype :bigquery-cloud-sdk
@@ -785,8 +784,8 @@
   ;; numbers, and underscores, start with a letter or underscore, and be at most 128 characters long.
   (let [s (-> (str/trim s)
               u/remove-diacritical-marks
-              (str/replace #"[^\w\d_]" "_")
-              (str/replace #"(^\d)" "_$1"))]
+              (str/replace #"[^\p{L}\p{N}\p{M}\p{Pc}]" "_")
+              (str/replace #"(^[^\p{L}_])" "_$1"))]
     ((get-method driver/escape-alias :sql) driver s)))
 
 ;; See:
@@ -902,13 +901,13 @@
     (into [tag] (map reconcile-temporal-types) args)
     (if-let [target-type (some temporal-type args)]
       (do
-        (log/tracef "Coercing args in %s to temporal type %s" (binding [*print-meta* true] (pr-str clause)) target-type)
+        (log/tracef "Coercing args in %s clause to temporal type %s" tag target-type)
         (u/prog1 (into [tag]
                        (map (partial ->temporal-type target-type))
                        args)
           (when (or (not= clause <>)
                     (not= (meta clause) (meta <>)))
-            (log/tracef "Coerced -> %s" (binding [*print-meta* true] (pr-str <>))))))
+            (log/trace "Coerced args to temporal type"))))
       clause)))
 
 (doseq [filter-type [:between := :!= :> :>= :< :<=]]
@@ -923,8 +922,15 @@
 ;;; |                                Other Driver / SQLDriver Method Implementations                                 |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
+(def ^:private bigquery-interval-units
+  "Allow-list of the temporal-interval units BigQuery's `INTERVAL` accepts. The unit is interpolated into `[:raw …]`,
+  which does no escaping, so it must be checked against this closed set before `(name unit)` is emitted."
+  #{:microsecond :millisecond :second :minute :hour :day :week :month :quarter :year})
+
 (defn- interval [amount unit]
   ;; todo: can bigquery have an expression here or just a numeric literal?
+  (when-not (contains? bigquery-interval-units unit)
+    (throw (ex-info (str "Invalid temporal unit: " (pr-str unit)) {:unit unit})))
   [:raw (format "INTERVAL %d %s" (int amount) (name unit))])
 
 ;; We can coerce the HoneySQL form this wraps to whatever we want and generate the appropriate SQL.
@@ -1036,9 +1042,22 @@
   [driver [_ field]]
   [:log (sql.qp/->honeysql driver field) [:inline 10]])
 
+;; GoogleSQL quoted identifiers support the same escape sequences as string literals: a backslash escapes the next
+;; character, and a literal backtick is written `\``. There is no doubling escape -- two adjacent backticks close one
+;; identifier and open the next -- so a backslash must be doubled before the wrapping backticks go on, otherwise it
+;; escapes the closing one and the rest of the identifier is parsed as raw SQL.
+(sql/register-dialect!
+ ::bigquery
+ (assoc (sql/get-dialect :mysql)
+        :quote (fn [s]
+                 (str \` (-> s
+                             (str/replace "\\" "\\\\")
+                             (str/replace "`" "\\`"))
+                      \`))))
+
 (defmethod sql.qp/quote-style :bigquery-cloud-sdk
   [_driver]
-  :mysql)
+  ::bigquery)
 
 (mu/defmethod sql.params.substitution/->replacement-snippet-info [:bigquery-cloud-sdk :metabase.lib.parameters.parse.types/field-filter]
   [driver                            :- :keyword

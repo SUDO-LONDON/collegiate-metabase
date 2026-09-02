@@ -195,7 +195,7 @@ describe("embed.js script tag for sdk iframe embedding", () => {
       defineMetabaseConfig({
         invalidKey1: "value1",
         invalidKey2: "value2",
-      } as any);
+      });
     }).toThrow("invalidKey1 is not a valid configuration name");
   });
 
@@ -220,6 +220,19 @@ describe("embed.js script tag for sdk iframe embedding", () => {
     expect(iframe?.src).toMatch(
       /^https:\/\/example\.com\/embed\/sdk\/v1\?embed-js-identifier=\d+$/,
     );
+  });
+
+  it('should have `allow="clipboard-write"` in the iframe to allow copying to clipboard in chrome', () => {
+    defineMetabaseConfig({
+      instanceUrl: "https://example.com",
+    });
+
+    const embed = document.createElement("metabase-dashboard");
+    embed.setAttribute("dashboard-id", "1");
+    document.body.appendChild(embed);
+
+    const iframe = embed.querySelector("iframe");
+    expect(iframe?.getAttribute("allow")).toBe("clipboard-write");
   });
 
   describe("guest embed token provider", () => {

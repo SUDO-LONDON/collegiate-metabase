@@ -20,8 +20,11 @@
    [metabase.test.http-client :as client]
    [metabase.upload.impl-test :as upload-test]
    [metabase.util :as u]
+   [metabase.util.quick-task :as quick-task]
    [metabase.warehouse-schema-rest.api.table :as api.table]
-   [toucan2.core :as t2]))
+   [toucan2.core :as t2])
+  (:import
+   (java.util.concurrent Executors)))
 
 (set! *warn-on-reflection* true)
 
@@ -1213,11 +1216,14 @@
 (deftest trigger-metadata-sync-for-table-test
   (testing "Can we trigger a metadata sync for a table?"
     (let [sync-called? (promise)
-          timeout (* 10 1000)]
+          timeout (* 60 1000)]
       (mt/with-premium-features #{:audit-app}
         (mt/with-temp [:model/Database {db-id :id} {:engine "h2", :details (:details (mt/db))}
                        :model/Table    table       {:db_id db-id :schema "PUBLIC"}]
-          (with-redefs [sync/sync-table! (deliver-when-tbl sync-called? table)]
+          ;; `with-redefs` would restore `sync-table!` when the request returns, before the async sync runs.
+          ;; `submit-task!` is stubbed so the sync doesn't queue behind other tasks on the 1-thread executor.
+          (mt/with-dynamic-fn-redefs [quick-task/submit-task! future-call
+                                      sync/sync-table!        (deliver-when-tbl sync-called? table)]
             (mt/user-http-request :crowberto :post 200 (format "table/%d/sync_schema" (u/the-id table))))))
       (testing "sync called?"
         (is (true?
@@ -1227,18 +1233,27 @@
   (testing "POST /api/table/:id/sync_schema"
     (testing "User with manage-table-metadata permission can sync table"
       (let [sync-called? (promise)
-            timeout (* 10 1000)]
-        (mt/with-premium-features #{:audit-app}
-          (mt/with-temp [:model/Database {db-id :id} {:engine "h2", :details (:details (mt/db))}
-                         :model/Table    table       {:db_id db-id :schema "PUBLIC"}]
-            (mt/with-no-data-perms-for-all-users!
-              ;; Grant only manage-table-metadata permission for this table
-              (data-perms/set-table-permission! (perms-group/all-users) (:id table) :perms/manage-table-metadata :yes)
-              (with-redefs [sync/sync-table! (deliver-when-tbl sync-called? table)]
-                (mt/user-http-request :rasta :post 200 (format "table/%d/sync_schema" (u/the-id table)))
-                (testing "sync called?"
-                  (is (true?
-                       (deref sync-called? timeout :sync-never-called))))))))))))
+            timeout (* 60 1000)
+            ;; Isolated pool: the shared one is process-wide and holds fire-and-forget tasks left behind by
+            ;; earlier tests, each with the default two-hour timeout. One of those still running ahead of
+            ;; this sync starves it past the deref below, which is what happens on driver CI, where those
+            ;; leftover tasks are real syncs over the network.
+            pool (Executors/newSingleThreadExecutor)]
+        (try
+          (mt/with-premium-features #{:audit-app}
+            (mt/with-temp [:model/Database {db-id :id} {:engine "h2", :details (:details (mt/db))}
+                           :model/Table    table       {:db_id db-id :schema "PUBLIC"}]
+              (mt/with-no-data-perms-for-all-users!
+                ;; Grant only manage-table-metadata permission for this table
+                (data-perms/set-table-permission! (perms-group/all-users) (:id table) :perms/manage-table-metadata :yes)
+                (with-redefs [quick-task/executor (delay pool)]
+                  (mt/with-dynamic-fn-redefs [sync/sync-table! (deliver-when-tbl sync-called? table)]
+                    (mt/user-http-request :rasta :post 200 (format "table/%d/sync_schema" (u/the-id table)))
+                    (testing "sync called?"
+                      (is (true?
+                           (deref sync-called? timeout :sync-never-called)))))))))
+          (finally
+            (.shutdownNow pool)))))))
 
 (deftest sync-schema-mirror-database-test
   (testing "POST /api/table/:id/sync_schema"
@@ -1246,10 +1261,19 @@
       (mt/with-temp [:model/Database {source-db-id :id} {:engine "h2", :details (:details (mt/db))}
                      :model/Database {mirror-db-id :id} {:engine "h2"
                                                          :details (:details (mt/db))
-                                                         :router_database_id source-db-id}
-                     :model/Table    table              {:db_id mirror-db-id :schema "PUBLIC"}]
-        (is (= "Not found."
-               (mt/user-http-request :crowberto :post 404 (format "table/%d/sync_schema" (u/the-id table)))))))))
+                                                         :router_database_id source-db-id}]
+        ;; A table can't exist on a mirror (destination) db in production (destinations aren't synced),
+        ;; so a normal `with-temp :model/Table` trips the destination-permission guard. Insert it
+        ;; directly to fabricate the mirror-db table this 404 test needs.
+        (let [table-id (t2/insert-returning-pk! (t2/table-name :model/Table)
+                                                {:db_id      mirror-db-id
+                                                 :schema     "PUBLIC"
+                                                 :name       "mirror_table"
+                                                 :active     true
+                                                 :created_at :%now
+                                                 :updated_at :%now})]
+          (is (= "Not found."
+                 (mt/user-http-request :crowberto :post 404 (format "table/%d/sync_schema" table-id)))))))))
 
 (deftest ^:parallel sync-schema-nonexistent-table-test
   (testing "POST /api/table/:id/sync_schema"
@@ -1361,6 +1385,37 @@
                       (map :id)
                       set))))))))
 
+(deftest published-only-filter-test
+  (testing "GET /api/table?published-only=true"
+    (testing "filters tables that are not published"
+      (mt/with-temp [:model/Database {db-id :id} {}
+                     :model/Table {table-1-id :id} {:db_id db-id
+                                                    :name "table_1"
+                                                    :active true
+                                                    :is_published true}
+                     :model/Table {table-2-id :id} {:db_id db-id
+                                                    :name "table_2"
+                                                    :active true
+                                                    :is_published false}]
+        (testing "both tables returned without filter"
+          (is (= #{table-1-id table-2-id}
+                 (->> (mt/user-http-request :crowberto :get 200 "table")
+                      (filter #(= (:db_id %) db-id))
+                      (map :id)
+                      set))))
+        (testing "both tables returned with published-only=false"
+          (is (= #{table-1-id table-2-id}
+                 (->> (mt/user-http-request :crowberto :get 200 "table" :published-only false)
+                      (filter #(= (:db_id %) db-id))
+                      (map :id)
+                      set))))
+        (testing "only table-1 is returned with published-only=true"
+          (is (= #{table-1-id}
+                 (->> (mt/user-http-request :crowberto :get 200 "table" :published-only true)
+                      (filter #(= (:db_id %) db-id))
+                      (map :id)
+                      set))))))))
+
 (deftest no-fks-for-missing-tables-test
   (testing "Check that we don't return foreign keys for missing/inactive tables"
     (mt/with-temp-test-data
@@ -1382,6 +1437,49 @@
         (jdbc/execute! db-spec "DROP TABLE country;")
         (sync/sync-database! db {:scan :schema})
         (is (= () (mt/user-http-request :rasta :get 200 (format "table/%d/fks" (mt/id :continent)))))))))
+
+(deftest get-fks-only-returns-readable-origin-fields-test
+  (testing "GET /api/table/:id/fks does not leak Fields belonging to Tables the caller cannot read"
+    (mt/with-no-data-perms-for-all-users!
+      ;; readable: the Table in the URL, which the FKs point at. unreadable: checkins, where they come from.
+      (data-perms/set-table-permission! (perms-group/all-users) (mt/id :users) :perms/view-data :unrestricted)
+      (data-perms/set-table-permission! (perms-group/all-users) (mt/id :users) :perms/create-queries :query-builder)
+      (testing "sanity: the caller can read the destination Table but not the origin one"
+        (is (=? {:id (mt/id :users)}
+                (mt/user-http-request :rasta :get 200 (format "table/%d" (mt/id :users)))))
+        (is (= "You don't have permissions to do that."
+               (mt/user-http-request :rasta :get 403 (format "table/%d" (mt/id :checkins))))))
+      (testing "an admin still sees the checkins.user_id -> users.id relationship"
+        (is (contains? (set (map :origin_id (mt/user-http-request :crowberto :get 200 (format "table/%d/fks" (mt/id :users)))))
+                       (mt/id :checkins :user_id))))
+      (testing "the caller gets nothing for it"
+        (is (= [] (mt/user-http-request :rasta :get 200 (format "table/%d/fks" (mt/id :users)))))))))
+
+(deftest update-table-collection-id-is-held-to-the-publish-bar-test
+  (testing "PUT /api/table/:id publishes a Table into a collection, so it takes more than metadata write permission"
+    (mt/with-temp [:model/Collection {plain-collection-id :id} {}
+                   :model/Table      {table-id :id}            {:db_id (mt/id) :schema "PUBLIC"}]
+      (testing "the destination has to be a Library/Data collection"
+        (is (= "Tables can only be published to Library/Data collections."
+               (mt/user-http-request :crowberto :put 400 (format "table/%d" table-id)
+                                     {:collection_id plain-collection-id})))
+        (is (nil? (t2/select-one-fn :collection_id :model/Table :id table-id))))
+      (testing "a destination that does not exist is a 404"
+        (is (= "Not found."
+               (mt/user-http-request :crowberto :put 404 (format "table/%d" table-id)
+                                     {:collection_id Integer/MAX_VALUE}))))
+      (testing "the rest of the body still applies on its own"
+        (is (=? {:display_name "Renamed"}
+                (mt/user-http-request :crowberto :put 200 (format "table/%d" table-id)
+                                      {:display_name "Renamed"}))))))
+  (testing "publishing into a Library/Data collection still works -- the Data Studio Library 'Move' action uses it"
+    (mt/with-temp [:model/Collection {data-collection-id :id} {:type "library-data"}
+                   :model/Table      {table-id :id}           {:db_id (mt/id) :schema "PUBLIC"}]
+      (is (=? {:collection_id data-collection-id}
+              (mt/user-http-request :crowberto :put 200 (format "table/%d" table-id)
+                                    {:collection_id data-collection-id})))
+      (is (= data-collection-id
+             (t2/select-one-fn :collection_id :model/Table :id table-id))))))
 
 ;;; ---------------------------------------- can-query and can-write filter tests ----------------------------------------
 
@@ -1449,3 +1547,16 @@
           (data-perms/set-table-permission! (perms-group/all-users) table-id :perms/create-queries :query-builder)
           (let [response (mt/user-http-request :rasta :get 202 (format "table/%d/data" table-id))]
             (is (map? response))))))))
+
+(deftest bulk-update-tables-visibility-persists-test
+  (testing "PUT /api/table with an ids vector flips visibility_type on every listed table"
+    (mt/with-temp [:model/Table {t1 :id} {:db_id (mt/id) :visibility_type nil}
+                   :model/Table {t2 :id} {:db_id (mt/id) :visibility_type nil}]
+      (mt/user-http-request :crowberto :put 200 "table"
+                            {:ids [t1 t2] :visibility_type "hidden"})
+      (is (= [:hidden :hidden]
+             (map #(t2/select-one-fn :visibility_type :model/Table :id %) [t1 t2])))
+      (mt/user-http-request :crowberto :put 200 "table"
+                            {:ids [t1 t2] :visibility_type nil})
+      (is (= [nil nil]
+             (map #(t2/select-one-fn :visibility_type :model/Table :id %) [t1 t2]))))))

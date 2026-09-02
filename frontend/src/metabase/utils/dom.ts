@@ -3,8 +3,6 @@ import _ from "underscore";
 import { isWithinIframe } from "metabase/utils/iframe";
 import MetabaseSettings from "metabase/utils/settings";
 
-import { checkNotNull } from "./types";
-
 // check whether scrollbars are visible to the user,
 // this is off by default on Macs, but can be changed
 // Always on on most other non mobile platforms
@@ -58,9 +56,20 @@ export function isObscured(
   return !element.contains(elem);
 }
 
+// site-url is null on instances where it was never set, and GlobalStyles calls this above any error
+// boundary, so throwing here white-screens the whole app. The sub-path is cosmetic; fall back to the root.
 export function getSitePath(): string {
-  const siteUrl = checkNotNull(MetabaseSettings.get("site-url"));
-  return new URL(siteUrl).pathname.toLowerCase();
+  const siteUrl = MetabaseSettings.get("site-url");
+
+  if (!siteUrl) {
+    return "/";
+  }
+
+  try {
+    return new URL(siteUrl).pathname.toLowerCase();
+  } catch {
+    return "/";
+  }
 }
 
 export function getWithSiteUrl(url: string): string {
@@ -198,6 +207,13 @@ export const getEventTarget = (
   if (!target) {
     target = document.createElement("div");
     target.id = "popover-event-target";
+    // This node is the virtual anchor a Mantine Popover attaches to. Position it
+    // as a tiny, click-through box at the cursor (left/top set below from the
+    // event's viewport coords) so the popover opens at the pointer location.
+    target.style.position = "fixed";
+    target.style.width = "6px";
+    target.style.height = "6px";
+    target.style.pointerEvents = "none";
     document.body.appendChild(target);
   }
 

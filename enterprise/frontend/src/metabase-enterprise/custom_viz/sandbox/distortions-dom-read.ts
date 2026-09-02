@@ -1,5 +1,7 @@
 import type { CustomVizPluginId } from "metabase-types/api";
 
+import { BLOCKED_TAGS } from "./distortions-dom-mutate";
+
 // DOM scoping: every Node crossing the membrane is filtered. Nodes inside
 // the plugin's mount subtree (marked with data-plugin-sandbox=<id>) pass
 // through real; nodes outside are replaced with a detached decoy of the
@@ -86,28 +88,12 @@ export function isDomNode(obj: unknown): obj is Node {
   return false;
 }
 
-function describeNode(node: Node): string {
-  if (node.nodeType === Node.ELEMENT_NODE) {
-    const el = node as Element;
-    const tag = el.nodeName.toLowerCase();
-    if (el.id) {
-      return `<${tag} id="${el.id}">`;
-    }
-    const testId = el.getAttribute("data-testid");
-    if (testId) {
-      return `<${tag} data-testid="${testId}">`;
-    }
-    return `<${tag}>`;
-  }
-  // For non-Elements, `nodeName` is the canonical descriptor (e.g.
-  // `#text`, `#comment`, `#document`, `#document-fragment`).
-  return `<${node.nodeName.toLowerCase()}>`;
-}
-
 function createDecoyForNode(node: Node): Node {
   switch (node.nodeType) {
     case Node.ELEMENT_NODE: {
-      const decoy = document.createElement(node.nodeName.toLowerCase());
+      const tagName = node.nodeName.toLowerCase();
+      const decoyTag = BLOCKED_TAGS.has(tagName) ? "div" : tagName;
+      const decoy = document.createElement(decoyTag);
       decoy.setAttribute("data-plugin-sandbox-decoy", "true");
       decoy.setAttribute("id", "sandbox-decoy");
       return decoy;
@@ -129,8 +115,6 @@ function makeDecoyNode(pluginId: CustomVizPluginId, node: Node): Node {
   if (decoy === node) {
     return node;
   }
-  console.error(
-    `[plugin ${pluginId}] swapped out-of-scope ${describeNode(node)} with decoy`,
-  );
+
   return decoy;
 }
